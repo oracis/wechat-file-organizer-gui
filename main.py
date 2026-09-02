@@ -2,7 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 微信文件自动归类 - 图形界面版 (wechat-file-organizer-gui)
-扫描微信 FileStorage/File 目录，按类型/月份归类、去重、生成报告，一键复制到独立目录。
+扫描微信文件目录（兼容传统 FileStorage/File 与新型自定义目录），
+按类型/月份归类、去重、生成报告，一键复制到独立目录。
 
 设计原则：
 - 零运行时依赖：仅用 Python 标准库（tkinter 自带）。
@@ -43,6 +44,21 @@ for _cat, _exts in CATEGORIES.items():
         EXT_TO_CAT[_e] = _cat
 
 MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
+
+# 兼容模式（递归扫描）时跳过的微信系统/缓存目录
+SYSTEM_DIRS = {
+    "all_users", "db_storage", "apm_record", "business", "resource",
+    "cache", "backup", "temp", "tmp", "logs", "log", "config", "mmkv",
+    "thumb", "thumbs", ".thumbnails", "favorite", "emoticon", "sns",
+    "xweb", "xeditor", "migrate", "InputTemp", "MsgAttach",
+}
+
+# 兼容模式时跳过的微信内部文件扩展名（非用户主动保存的文件）
+SKIP_EXTS = {
+    ".dat", ".db", ".db-wal", ".db-shm", ".mmkv", ".crc", ".kvdb",
+    ".kvdb-wal", ".kvdb-shm", ".ini", ".lock", ".tmp", ".temp", ".bak",
+    ".shm", ".wal", ".sqlite", ".sqlitedb",
+}
 
 
 # ---------- 中文宽度对齐 ----------
@@ -118,7 +134,33 @@ def discover_accounts(root):
     return accounts
 
 
-def collect_sources(root, include_media=False, scan_all=False):
+def recursive_collect(root):
+    """兼容模式：递归扫描整个目录，跳过微信系统目录与内部文件。"""
+    files = []
+    seen = set()
+    for dirpath, dirnames, fnames in os.walk(root):
+        # 过滤系统目录（不区分大小写）
+        dirnames[:] = [d for d in dirnames
+                       if d.lower() not in SYSTEM_DIRS and not d.startswith(".")]
+        for fn in fnames:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext in SKIP_EXTS:
+                continue
+            p = os.path.join(dirpath, fn)
+            if p in seen:
+                continue
+            seen.add(p)
+            files.append(p)
+    return files
+
+
+def collect_sources(root, include_media=False, scan_all=False, recursive=False):
+    if recursive:
+        files = recursive_collect(root)
+        if not include_media:
+            files = [f for f in files
+                     if os.path.splitext(f)[1].lower() != ".dat"]
+        return files
     files = []
     targets = []
     for fs in discover_accounts(root):
@@ -174,6 +216,7 @@ class OrganizerApp:
         self.dest_dir = tk.StringVar()
         self.scheme = tk.StringVar(value="type")
         self.dedupe = tk.BooleanVar(value=False)
+        self.deep_scan = tk.BooleanVar(value=False)
         self.scanning = False
 
         detected = find_wechat_files_dir() or ""
@@ -206,6 +249,8 @@ class OrganizerApp:
             side="left", padx=(0, 8), pady=8)
         ttk.Checkbutton(f_set, text="去重（相同内容只保留一份）", variable=self.dedupe).pack(
             side="left", padx=(4, 8), pady=8)
+        ttk.Checkbutton(f_set, text="兼容模式（递归扫描任意目录，忽略微信系统文件）",
+                        variable=self.deep_scan).pack(side="left", padx=(4, 8), pady=8)
 
         # 输出目录
         f_dst = ttk.LabelFrame(self.master, text="输出目录（源文件不会被删除，只复制到此处）")
@@ -291,10 +336,18 @@ class OrganizerApp:
         self.progress.start()
         self.status.set("正在扫描...")
         self.log("开始扫描: " + root)
+
+        # 未检测到传统结构时，自动启用兼容模式
+        if not discover_accounts(root) and not self.deep_scan.get():
+            self.deep_scan.set(True)
+            self.log("[INFO] 未检测到传统 FileStorage/File 结构，已自动启用兼容模式（递归扫描）。")
+
         threading.Thread(target=self._do_scan, args=(root,), daemon=True).start()
 
     def _do_scan(self, root):
-        files = collect_sources(root, include_media=False, scan_all=False)
+        recursive = self.deep_scan.get()
+        files = collect_sources(root, include_media=False, scan_all=False,
+                                recursive=recursive)
         if not files:
             self.master.after(0, self._on_scan_empty, root)
             return
@@ -318,7 +371,8 @@ class OrganizerApp:
         self.status.set("未发现可归类的文件")
         self.stat_var.set("未发现可归类的文件（目录下可能没有 FileStorage/File）")
         self.log("[SKIP] 未发现可归类的文件。")
-        self.log("提示：默认只扫描 File/ 目录且跳过加密的 .dat 文件。")
+        self.log("提示：已尝试兼容模式（递归扫描）仍无结果。")
+        self.log("      请确认所选目录下确实包含微信接收的文档/图片/视频等文件。")
 
     def _on_scan_done(self, root):
         self.scanning = False
