@@ -1,0 +1,69 @@
+# 微信文件自动归类（图形界面版）
+
+给**只装了微信、没装任何编程工具**的普通人用的图形界面小工具。
+双击打开，自动找到微信下载的文件，按类型 / 月份整理好，一键复制到干净的新目录。
+
+> 这是 [`wechat-file-organizer`](https://github.com/oracis/wechat-file-organizer) 的**独立桌面版**。
+> 那个仓库是给 AI 助手（WorkBuddy 等）调用的「技能」；本仓库是**人人能用的 exe 程序**。
+
+---
+
+## 下载与使用
+
+1. 到 [Releases](../../releases) 下载 `WeChatFileOrganizer.exe`（单文件，免安装）。
+2. 双击运行（Windows 10/11）。
+3. 程序会自动探测 `文档\WeChat Files`；若没找到，点「浏览」手动选。
+4. 选归类方式（默认按类型），点「扫描」，先看预览报告。
+5. 确认无误，点「一键归类」，文件会复制到输出目录。
+
+**源文件永远不被删除、不被移动**——只复制。
+
+---
+
+## 功能
+
+- **自动探测**微信文件目录（`文档\WeChat Files\<账号>\FileStorage\File`）。
+- **三种归类方式**：
+  - `type` 按类型（文档 / 图片 / 压缩包 / 视频 / 音频 / 其他）
+  - `month` 按月份（2026-01、2026-02…）
+  - `type-month` 类型 + 月份（推荐，最清晰）
+- **去重**：相同内容的文件只保留一份，重复项跳过并报告可节省空间。
+- **预览优先**：扫描只出报告，任何改动都要你点「一键归类」才发生。
+- **中文友好**：目录、文件名、统计全中文无乱码。
+- **零依赖**：纯 Python 标准库，打包后单 exe 即可运行。
+
+---
+
+## 安全说明
+
+- 默认**只读扫描**，绝不触碰你的文件。
+- 「一键归类」只做 `复制`，**不删除、不移动**源文件，随时可删输出目录重来。
+- 不联网、不上传、不读任何凭据。纯本地工具。
+
+---
+
+## 自己重新打包（开发者）
+
+需要 Windows + 含 Tcl/Tk 的 Python 3.10+（官方安装包默认包含）。
+
+```bat
+build.bat
+```
+
+或手动：
+
+```bat
+python -m venv build\venv
+build\venv\Scripts\python.exe -m pip install pyinstaller
+build\venv\Scripts\pyinstaller --onefile --windowed --name WeChatFileOrganizer main.py
+```
+
+产物在 `dist\WeChatFileOrganizer.exe`。
+
+> 注意：WorkBuddy 自带的精简 Python 没有 tkinter，打包请用自己的系统 Python。
+
+---
+
+## License
+
+MIT © oracis
