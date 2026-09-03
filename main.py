@@ -13,15 +13,22 @@
 - v1.5.0：文件列表拆分为「原始文件」与「归类副本」两个标签页，删除后自动刷新。
 - v1.6.0：新增「按修改时间筛选」（最近7/30/90天、今年、自定义日期区间）与「输出目录结构自定义」（按类型/月份/年份/组合 + 自定义路径模板如 {type}/{yyyy}/{mm}）。
 - v1.7.0：新增「按文件大小筛选」（全部/≥1MB/≥10MB/≥100MB/自定义MB）与自定义模板「实时路径预览」。
+- v1.8.0：新增「检查更新」——启动后静默查询 GitHub Releases 最新版本，有新版本时状态栏提示；点「检查更新」显示下载链接（纯本地 urllib 查询，无依赖、不收集信息）。
 """
 import os
 import re
 import sys
 import time
+import json
 import shutil
 import threading
 import unicodedata
+import urllib.request
 from datetime import datetime
+
+# 当前版本与更新检查仓库（公开 Release）
+APP_VERSION = "1.8.0"
+UPDATE_REPO = "oracis/wechat-file-organizer-gui"
 
 try:
     import tkinter as tk
@@ -530,6 +537,9 @@ class OrganizerApp:
         self.del_orig_btn = ttk.Button(f_act, text="清理原始文件（回收站）",
                                        command=self.delete_originals, state="disabled")
         self.del_orig_btn.pack(side="left", padx=(0, 10))
+        self.update_btn = ttk.Button(f_act, text="检查更新",
+                                     command=lambda: self._check_update(verbose=True))
+        self.update_btn.pack(side="left", padx=(0, 10))
         self.progress = ttk.Progressbar(f_act, mode="indeterminate", length=160)
         self.progress.pack(side="left", padx=(12, 0))
 
@@ -624,6 +634,9 @@ class OrganizerApp:
         self.status = tk.StringVar(value="就绪")
         ttk.Label(self.master, textvariable=self.status, relief="sunken",
                   anchor="w").pack(fill="x", side="bottom")
+
+        # 启动后静默检查更新（仅状态栏提示，不打扰）
+        self.master.after(2000, lambda: self._check_update(verbose=False))
 
     def log(self, msg):
         self.logbox.configure(state="normal")
@@ -1305,6 +1318,57 @@ class OrganizerApp:
         sample = build_from_template(tmpl, "文档", "2026-03",
                                     datetime.now().timestamp(), "示例文件.pdf")
         self.tmpl_preview.configure(text="示例 → " + sample.replace("\\", "/"))
+
+    # ---------- 更新检查 ----------
+    @staticmethod
+    def _parse_ver(s):
+        s = s.strip().lstrip("vV")
+        out = []
+        for p in re.split(r"[.\-]", s):
+            m = re.match(r"\d+", p)
+            out.append(int(m.group(0)) if m else 0)
+        return out
+
+    def _is_newer(self, latest, current):
+        return self._parse_ver(latest) > self._parse_ver(current)
+
+    def _check_update(self, verbose=True):
+        threading.Thread(target=self._do_check_update, args=(verbose,),
+                         daemon=True).start()
+
+    def _do_check_update(self, verbose):
+        try:
+            url = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "WeChatFileOrganizer"})
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            tag = data.get("tag_name", "")
+            html = data.get("html_url", "")
+            if not tag or not self._is_newer(tag, APP_VERSION):
+                if verbose:
+                    self.master.after(
+                        0, lambda: messagebox.showinfo(
+                            "已是最新", "当前已是最新版本 %s。" % APP_VERSION))
+                return
+            dl = ""
+            for a in data.get("assets", []):
+                if a.get("name", "").endswith(".exe"):
+                    dl = a.get("browser_download_url", "")
+                    break
+            self.master.after(
+                0, lambda: self.status.set(
+                    "发现新版本 %s，点「检查更新」查看下载链接" % tag))
+            if verbose:
+                msg = ("发现新版本 %s（当前 %s）。\n\n下载地址：\n%s"
+                       % (tag, APP_VERSION, dl or html))
+                self.master.after(
+                    0, lambda: messagebox.showinfo("有新版本可用", msg))
+        except Exception as e:
+            if verbose:
+                self.master.after(
+                    0, lambda: messagebox.showwarning(
+                        "检查更新失败", "无法连接更新服务器：%s" % e))
 
 
 
