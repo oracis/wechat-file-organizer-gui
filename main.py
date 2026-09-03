@@ -43,6 +43,13 @@ for _cat, _exts in CATEGORIES.items():
     for _e in _exts:
         EXT_TO_CAT[_e] = _cat
 
+# 归类方式：界面显示名 -> 内部键
+SCHEME_LABELS = {
+    "按类型": "type",
+    "按月份": "month",
+    "按类型+月份": "type-month",
+}
+
 # Tk 的 PhotoImage 能直接显示的常见图片格式（jpg 需 PIL，故回退到系统打开）
 IMAGE_PREVIEW_EXTS = {".png", ".gif", ".bmp", ".tiff", ".tif"}
 
@@ -265,7 +272,7 @@ class OrganizerApp:
 
         self.source_dir = tk.StringVar()
         self.dest_dir = tk.StringVar()
-        self.scheme = tk.StringVar(value="type")
+        self.scheme = tk.StringVar(value="按类型")
         self.dedupe = tk.BooleanVar(value=False)
         self.deep_scan = tk.BooleanVar(value=False)
         self.scanning = False
@@ -295,10 +302,8 @@ class OrganizerApp:
         f_set.pack(fill="x", **pad)
         ttk.Label(f_set, text="归类方式:").pack(side="left", padx=(8, 4), pady=8)
         cb = ttk.Combobox(f_set, textvariable=self.scheme, width=20, state="readonly")
-        cb["values"] = ("type", "month", "type-month")
+        cb["values"] = tuple(SCHEME_LABELS.keys())
         cb.pack(side="left", padx=(0, 12), pady=8)
-        ttk.Label(f_set, text="（按类型 / 按月份 / 类型+月份）").pack(
-            side="left", padx=(0, 8), pady=8)
         ttk.Checkbutton(f_set, text="去重（相同内容只保留一份）", variable=self.dedupe).pack(
             side="left", padx=(4, 8), pady=8)
         ttk.Checkbutton(f_set, text="兼容模式（递归扫描任意目录）",
@@ -577,7 +582,7 @@ class OrganizerApp:
         threading.Thread(target=self._do_apply, args=(dest,), daemon=True).start()
 
     def _do_apply(self, dest):
-        scheme = self.scheme.get()
+        scheme = SCHEME_LABELS.get(self.scheme.get(), "type")
         dedupe = self.dedupe.get()
         os.makedirs(dest, exist_ok=True)
         used = set()
