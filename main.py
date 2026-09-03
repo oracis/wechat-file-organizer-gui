@@ -17,6 +17,7 @@
 - v1.9.0：简化「输出目录结构」选择，去掉模板令牌/自定义模板，改为直白的固定选项（按文件类型/按月份/按年份/按类型+月份/按类型+年份/按年份+月份/按类型+年份+月份），并实时显示整理示例。
 - v1.10.0：启动后自动扫描（微信目录有效时），并顶部显示三步使用提示，让普通用户打开即见结果。
 - v1.11.0：一键归类完成后自动打开输出文件夹；兼容模式标签改为更直白的「扫描整个文件夹（适合新版微信）」。
+- v1.12.0：记住用户上次使用的整理方式、筛选、类别勾选和输出目录；新增「打开输出文件夹」按钮，让重复使用更顺手。
 """
 import os
 import re
@@ -30,7 +31,7 @@ import urllib.request
 from datetime import datetime
 
 # 当前版本与更新检查仓库（公开 Release）
-APP_VERSION = "1.11.0"
+APP_VERSION = "1.12.0"
 UPDATE_REPO = "oracis/wechat-file-organizer-gui"
 
 try:
@@ -40,6 +41,10 @@ except ImportError:
     sys.exit("本程序需要 Tkinter 图形库（Python 标准库自带，正常情况下已包含）。")
 
 MB = 1024 * 1024
+
+# 用户设置持久化文件
+CONFIG_PATH = os.path.join(os.path.expanduser("~"),
+                           ".wechat_file_organizer_config.json")
 
 # 分类规则：扩展名 -> 类别
 CATEGORIES = {
@@ -384,9 +389,13 @@ class OrganizerApp:
         # 分类勾选（默认全勾）
         self.cat_enabled = {c: tk.BooleanVar(value=True) for c in CATEGORIES}
 
+        # 加载上次使用的设置（源目录仍每次自动探测，不保存）
+        self._load_config()
+
         detected = find_wechat_files_dir() or ""
         self.source_dir.set(detected)
-        self.dest_dir.set(default_output_dir())
+        if not self.dest_dir.get().strip():
+            self.dest_dir.set(default_output_dir())
 
         self._build_ui()
 
@@ -450,6 +459,8 @@ class OrganizerApp:
         self.date_to_entry.pack(side="left", padx=(0, 6))
         ttk.Label(tf, text="格式 YYYY-MM-DD（仅「自定义」时可用）").pack(
             side="left", padx=(4, 0))
+        self._on_time_range_change()
+
         # 第二行：大小筛选
         tf2 = ttk.Frame(f_filter)
         tf2.pack(fill="x", padx=10, pady=(0, 6))
@@ -465,6 +476,7 @@ class OrganizerApp:
         self.min_mb_entry.pack(side="left", padx=(0, 6))
         ttk.Label(tf2, text="（仅「自定义(MB)」时可用）").pack(
             side="left", padx=(4, 0))
+        self._on_size_filter_change()
 
         # 归类类别勾选
         f_cat = ttk.LabelFrame(self.master, text="归类类别（取消勾选则不整理该类）")
@@ -496,10 +508,13 @@ class OrganizerApp:
         self.del_orig_btn = ttk.Button(f_act, text="清理原始文件（回收站）",
                                        command=self.delete_originals, state="disabled")
         self.del_orig_btn.pack(side="left", padx=(0, 10))
+        self.open_dest_btn = ttk.Button(f_act, text="打开输出文件夹",
+                                        command=self.open_dest_folder)
+        self.open_dest_btn.pack(side="left", padx=(0, 10))
         self.update_btn = ttk.Button(f_act, text="检查更新",
                                      command=lambda: self._check_update(verbose=True))
         self.update_btn.pack(side="left", padx=(0, 10))
-        self.progress = ttk.Progressbar(f_act, mode="indeterminate", length=160)
+        self.progress = ttk.Progressbar(f_act, mode="indeterminate", length=120)
         self.progress.pack(side="left", padx=(12, 0))
 
         # 统计
@@ -604,6 +619,9 @@ class OrganizerApp:
         src = self.source_dir.get().strip()
         if src and os.path.isdir(src):
             self.master.after(1200, self.scan)
+
+        # 关闭窗口时保存当前设置
+        self.master.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def log(self, msg):
         self.logbox.configure(state="normal")
@@ -1292,6 +1310,73 @@ class OrganizerApp:
             hint = "文件会被整理到"
         self.scheme_preview.configure(
             text="%s：%s" % (hint, sample.replace("\\", "/")))
+
+    # ---------- 设置记忆 + 打开输出文件夹 ----------
+    def _load_config(self):
+        """从配置文件恢复上次使用的设置（不保存源目录）。"""
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(cfg, dict):
+            return
+        if cfg.get("scheme") in SCHEME_LABELS:
+            self.scheme.set(cfg["scheme"])
+        if cfg.get("dedupe") in (True, False):
+            self.dedupe.set(cfg["dedupe"])
+        if cfg.get("deep_scan") in (True, False):
+            self.deep_scan.set(cfg["deep_scan"])
+        if cfg.get("time_range") in TIME_RANGES:
+            self.time_range.set(cfg["time_range"])
+        if cfg.get("size_filter") in SIZE_FILTERS:
+            self.size_filter.set(cfg["size_filter"])
+        if isinstance(cfg.get("min_mb"), str):
+            self.min_mb.set(cfg["min_mb"])
+        if isinstance(cfg.get("dest_dir"), str) and cfg["dest_dir"]:
+            self.dest_dir.set(cfg["dest_dir"])
+        cats = cfg.get("categories")
+        if isinstance(cats, dict):
+            for c, v in cats.items():
+                if c in self.cat_enabled and v in (True, False):
+                    self.cat_enabled[c].set(v)
+
+    def _save_config(self):
+        """保存当前设置到配置文件。"""
+        cfg = {
+            "scheme": self.scheme.get(),
+            "dedupe": self.dedupe.get(),
+            "deep_scan": self.deep_scan.get(),
+            "time_range": self.time_range.get(),
+            "size_filter": self.size_filter.get(),
+            "min_mb": self.min_mb.get(),
+            "dest_dir": self.dest_dir.get(),
+            "categories": {c: v.get() for c, v in self.cat_enabled.items()},
+        }
+        try:
+            d = os.path.dirname(CONFIG_PATH)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+
+    def _on_close(self):
+        """关闭窗口时保存设置并退出。"""
+        self._save_config()
+        self.master.destroy()
+
+    def open_dest_folder(self):
+        """手动打开输出文件夹。"""
+        d = self.dest_dir.get().strip()
+        if not d or not os.path.isdir(d):
+            messagebox.showinfo("提示", "输出文件夹尚不存在，请先「一键归类」。")
+            return
+        try:
+            os.startfile(d)
+        except Exception as e:
+            self.log("[WARN] 无法打开输出文件夹: " + str(e))
 
     # ---------- 更新检查 ----------
     @staticmethod
