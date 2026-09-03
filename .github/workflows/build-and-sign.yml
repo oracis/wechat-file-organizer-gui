@@ -1,0 +1,116 @@
+name: Build and Sign Windows EXE
+
+# Builds the single-file EXE with PyInstaller on GitHub-hosted Windows,
+# then (optionally) Authenticode-signs it via SignPath Foundation's free
+# open-source code signing. If the SignPath secrets are NOT configured,
+# the unsigned EXE is released anyway, so the pipeline never blocks.
+#
+# SignPath setup guide: docs/windows-code-signing.md
+# Trigger a release by pushing a tag, e.g.:  git tag v1.14.0 && git push origin v1.14.0
+# or run this workflow manually from the Actions tab and enter a version.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version tag, e.g. v1.14.0'
+        required: true
+        default: 'v1.14.0'
+
+permissions:
+  contents: write   # create the GitHub release and upload the asset
+  actions: read     # SignPath action reads workflow/job metadata
+  id-token: write   # OIDC, used by SignPath trusted-build verification
+
+jobs:
+  build-and-sign:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install PyInstaller and Pillow
+        # Pillow 用于图片缩略图预览；缺失时程序自动降级，不影响主流程
+        run: pip install "pyinstaller>=6.0" "pillow>=10.0"
+
+      - name: Build EXE (PyInstaller --onefile --windowed)
+        # 排除 numpy（Pillow 间接依赖，本工具不用，可省约 12MB）
+        run: >
+          pyinstaller --onefile --windowed --name WeChatFileOrganizer
+          --distpath dist
+          --exclude-module numpy
+          --exclude-module PIL.ImageQt
+          --exclude-module PIL.ImageShow
+          main.py
+
+      - name: Upload unsigned artifact
+        id: upload-unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: WeChatFileOrganizer-unsigned
+          path: dist/WeChatFileOrganizer.exe
+          if-no-files-found: error
+
+      - name: Check SignPath configuration
+        id: signpath-check
+        shell: bash
+        env:
+          TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          ORG_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          PROJECT: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          POLICY: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+        run: |
+          if [ -n "$TOKEN" ] && [ -n "$ORG_ID" ] && [ -n "$PROJECT" ] && [ -n "$POLICY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::SignPath configured — EXE will be Authenticode-signed"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::SignPath secrets/vars missing — EXE will be released UNSIGNED. See docs/windows-code-signing.md"
+          fi
+
+      - name: Sign with SignPath
+        if: steps.signpath-check.outputs.enabled == 'true'
+        uses: signpath/github-action-submit-signing-request@v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG || 'default' }}
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+      - name: Use unsigned binary if SignPath unavailable
+        if: steps.signpath-check.outputs.enabled != 'true'
+        shell: cmd
+        run: mkdir signed && copy dist\WeChatFileOrganizer.exe signed\
+
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+        run: |
+          ASSETS="signed/WeChatFileOrganizer.exe"
+          if [ -f CHANGELOG.md ]; then
+            ASSETS="$ASSETS CHANGELOG.md"
+          fi
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $TAG already exists (created manually); skipping auto release."
+            exit 0
+          fi
+          gh release create "$TAG" $ASSETS \
+            --repo "${{ github.repository }}" \
+            --title "WeChat File Organizer $TAG" \
+            --notes "Automated PyInstaller build. Signed via SignPath when configured; otherwise unsigned (SmartScreen warning may appear)."
