@@ -8,7 +8,7 @@
 设计原则：
 - 零运行时依赖：仅用 Python 标准库（tkinter 自带）。
 - 安全优先：默认只扫描、生成预览报告，绝不改动任何源文件；点「一键归类」才复制。
-- 「清理原始文件」为可选显式操作：仅删除已成功复制过的原始文件，且一律移入回收站（可恢复），绝不永久删除无副本的源文件。
+- 「清理原始文件」为可选显式操作：选定后移入回收站（可恢复），默认不永久删除；批量清理时会提示哪些文件已有归类副本、哪些尚未归类，由用户确认后再执行。
 - 中文路径/文件名友好。
 - v1.5.0：文件列表拆分为「原始文件」与「归类副本」两个标签页，删除后自动刷新。
 """
@@ -375,7 +375,7 @@ class OrganizerApp:
                 command=self._refresh_will).pack(side="left", padx=(8, 6), pady=6)
 
         # 输出目录
-        f_dst = ttk.LabelFrame(self.master, text="输出目录（归类副本存放处；原始文件可在确认后移入回收站）")
+        f_dst = ttk.LabelFrame(self.master, text="输出目录（归类副本存放处；原始文件可在确认后直接移入回收站，无需先归类）")
         f_dst.pack(fill="x", **pad)
         ttk.Entry(f_dst, textvariable=self.dest_dir, width=86).pack(
             side="left", fill="x", expand=True, padx=(8, 4), pady=8)
@@ -511,6 +511,7 @@ class OrganizerApp:
         if d:
             self.source_dir.set(d)
             self.apply_btn.configure(state="disabled")
+            self.del_orig_btn.configure(state="disabled")
             self.tree.delete(*self.tree.get_children())
             self.tree_files.delete(*self.tree_files.get_children())
             self.tree_outputs.delete(*self.tree_outputs.get_children())
@@ -581,6 +582,7 @@ class OrganizerApp:
         self.progress.stop()
         self.scan_btn.configure(state="normal")
         self.apply_btn.configure(state="normal")
+        self.del_orig_btn.configure(state="normal")
 
         records = self.records
         total = len(records)
@@ -952,49 +954,54 @@ class OrganizerApp:
         if not rec:
             return
         src = rec["path"]
-        dst = self.copy_map.get(src)
-        if not dst or not os.path.exists(dst):
-            messagebox.showinfo(
-                "提示",
-                "该文件的归类副本不存在，无法确认安全删除原始文件。\n请先「一键归类」成功后再清理原始文件。")
-            return
         if not os.path.exists(src):
             messagebox.showinfo("提示", "原始文件已不存在：\n" + src)
             self._refresh_original_list()
             return
-        ans = messagebox.askyesno(
-            "删除原始文件（回收站）",
-            "将把微信【原始文件】移入回收站（可在回收站恢复），输出目录中的副本会保留：\n%s\n\n大小：%s\n\n是否继续？"
-            % (src, human(os.path.getsize(src))))
+        dst = self.copy_map.get(src)
+        has_copy = dst and os.path.exists(dst)
+        if has_copy:
+            msg = ("将把微信【原始文件】移入回收站（可在回收站恢复），输出目录中的副本会保留：\n%s\n\n"
+                   "大小：%s\n\n是否继续？") % (src, human(os.path.getsize(src)))
+        else:
+            msg = ("【注意】该文件尚未归类（没有输出目录副本）。\n"
+                   "仍要把微信【原始文件】移入回收站（可在回收站恢复）：\n%s\n\n"
+                   "大小：%s\n\n是否继续？") % (src, human(os.path.getsize(src)))
+        ans = messagebox.askyesno("删除原始文件（回收站）", msg)
         if not ans:
             return
         ok, failures = send_to_recycle_bin([src])
         if ok:
             self.log("[DEL-ORIG] 已移入回收站: " + src)
             self.status.set("已清理 1 个原始文件（回收站）")
+            # 若该文件曾在 copy_map 中，清理掉已不存在的源
+            if src in self.copy_map and not os.path.exists(src):
+                self.copy_map.pop(src, None)
             self._refresh_original_list()
         else:
             for p, r in failures:
                 self.log("[WARN] 删除原始文件失败: " + p + " (" + r + ")")
 
     def delete_originals(self):
-        if not self.has_organized:
-            messagebox.showinfo("提示", "请先「一键归类」成功后再清理原始文件。")
+        files = [r["path"] for r in self.file_list if os.path.exists(r["path"])]
+        if not files:
+            messagebox.showinfo("提示", "当前没有可清理的原始文件。")
             return
         pairs = self._verified_original_pairs()
-        if not pairs:
-            messagebox.showinfo(
-                "提示",
-                "没有可清理的原始文件（需先归类成功、且原始与副本都存在）。")
-            return
-        total = sum(os.path.getsize(s) for s, _ in pairs)
-        ans = messagebox.askyesno(
-            "清理原始文件（回收站）",
-            "即将把 %d 个微信【原始文件】移入回收站（可在回收站里恢复），\n"
-            "输出目录中的副本会完整保留。\n\n"
-            "仅清理已成功复制到输出目录的原始文件，避免误删。\n"
-            "文件总大小：%s\n\n是否继续？"
-            % (len(pairs), human(total)))
+        copied_count = len(pairs)
+        total = sum(os.path.getsize(p) for p in files)
+        if copied_count:
+            msg = ("即将把 %d 个微信【原始文件】移入回收站（可在回收站里恢复），\n"
+                   "其中 %d 个已有归类副本（输出目录副本会保留），\n"
+                   "%d 个尚未归类。\n\n"
+                   "文件总大小：%s\n\n是否继续？"
+                   % (len(files), copied_count, len(files) - copied_count, human(total)))
+        else:
+            msg = ("即将把 %d 个微信【原始文件】移入回收站（可在回收站里恢复）。\n"
+                   "这些文件都尚未归类（没有输出目录副本）。\n\n"
+                   "文件总大小：%s\n\n是否继续？"
+                   % (len(files), human(total)))
+        ans = messagebox.askyesno("清理原始文件（回收站）", msg)
         if not ans:
             return
         self.scan_btn.configure(state="disabled")
@@ -1002,32 +1009,29 @@ class OrganizerApp:
         self.del_orig_btn.configure(state="disabled")
         self.progress.start()
         self.status.set("正在清理原始文件（回收站）...")
-        self.log("开始清理原始文件（移入回收站），共 %d 个，%s" % (len(pairs), human(total)))
-        threading.Thread(target=self._do_delete_originals, args=(pairs,),
+        self.log("开始清理原始文件（移入回收站），共 %d 个，%s"
+                 % (len(files), human(total)))
+        threading.Thread(target=self._do_delete_originals, args=(files,),
                          daemon=True).start()
 
-    def _do_delete_originals(self, pairs):
-        ok_total = 0
-        failures = []
-        for src, _ in pairs:
-            ok, fails = send_to_recycle_bin([src])
-            ok_total += ok
-            failures.extend(fails)
+    def _do_delete_originals(self, files):
+        ok_total, failures = send_to_recycle_bin(files)
         # 清理 copy_map 中已被移入回收站的原始项
-        done_srcs = {s for s, _ in pairs if not os.path.exists(s)}
-        self.copy_map = {k: v for k, v in self.copy_map.items() if k not in done_srcs}
+        done_srcs = {p for p in files if not os.path.exists(p)}
+        for p in done_srcs:
+            self.copy_map.pop(p, None)
         self.master.after(0, self._on_delete_originals_done,
-                          ok_total, len(pairs), failures)
+                          ok_total, len(files), failures)
 
     def _on_delete_originals_done(self, ok, total, failures):
         self.progress.stop()
         self.scan_btn.configure(state="normal")
         self.apply_btn.configure(state="normal")
-        if self.copy_map:
+        self._refresh_original_list()
+        if self.file_list:
             self.del_orig_btn.configure(state="normal")
         else:
             self.del_orig_btn.configure(state="disabled")
-        self._refresh_original_list()
         self.status.set("原始文件清理完成")
         self.log("[OK] 已将 %d / %d 个原始文件移入回收站" % (ok, total))
         for p, r in failures:
