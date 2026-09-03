@@ -12,6 +12,7 @@
 - 中文路径/文件名友好。
 - v1.5.0：文件列表拆分为「原始文件」与「归类副本」两个标签页，删除后自动刷新。
 - v1.6.0：新增「按修改时间筛选」（最近7/30/90天、今年、自定义日期区间）与「输出目录结构自定义」（按类型/月份/年份/组合 + 自定义路径模板如 {type}/{yyyy}/{mm}）。
+- v1.7.0：新增「按文件大小筛选」（全部/≥1MB/≥10MB/≥100MB/自定义MB）与自定义模板「实时路径预览」。
 """
 import os
 import re
@@ -58,6 +59,9 @@ SCHEME_LABELS = {
 
 # 扫描筛选：时间范围
 TIME_RANGES = ["全部", "最近7天", "最近30天", "最近90天", "今年", "自定义"]
+
+# 扫描筛选：文件大小
+SIZE_FILTERS = ["全部", "≥1MB", "≥10MB", "≥100MB", "自定义(MB)"]
 
 # 自定义路径模板令牌（如 {type}/{yyyy}/{mm}）
 TEMPLATE_TOKEN_RE = re.compile(r"\{([^}]+)\}")
@@ -401,6 +405,8 @@ class OrganizerApp:
         self.tmpl = tk.StringVar(value="{type}/{yyyy}/{mm}")
         self.date_from = tk.StringVar()
         self.date_to = tk.StringVar()
+        self.size_filter = tk.StringVar(value="全部")
+        self.min_mb = tk.StringVar()
         self.scanning = False
 
         # 分类勾选（默认全勾）
@@ -451,6 +457,10 @@ class OrganizerApp:
         self.tmpl_entry = ttk.Entry(fe, textvariable=self.tmpl, width=42,
                                     state="disabled")
         self.tmpl_entry.pack(side="left", fill="x", expand=True)
+        self.tmpl_entry.bind("<KeyRelease>",
+                             lambda e: self._update_template_preview())
+        self.tmpl_preview = ttk.Label(f_struct, text="", foreground="#888888")
+        self.tmpl_preview.pack(anchor="w", padx=10, pady=(0, 8))
 
         # 扫描筛选：时间范围
         f_filter = ttk.LabelFrame(
@@ -473,6 +483,21 @@ class OrganizerApp:
                                         width=12, state="disabled")
         self.date_to_entry.pack(side="left", padx=(0, 6))
         ttk.Label(tf, text="格式 YYYY-MM-DD（仅「自定义」时可用）").pack(
+            side="left", padx=(4, 0))
+        # 第二行：大小筛选
+        tf2 = ttk.Frame(f_filter)
+        tf2.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(tf2, text="文件大小:").pack(side="left", padx=(0, 4))
+        cb_s = ttk.Combobox(tf2, textvariable=self.size_filter, width=14,
+                            state="readonly")
+        cb_s["values"] = tuple(SIZE_FILTERS)
+        cb_s.bind("<<ComboboxSelected>>", self._on_size_filter_change)
+        cb_s.pack(side="left", padx=(0, 10))
+        ttk.Label(tf2, text="最小(MB):").pack(side="left", padx=(0, 2))
+        self.min_mb_entry = ttk.Entry(tf2, textvariable=self.min_mb,
+                                      width=12, state="disabled")
+        self.min_mb_entry.pack(side="left", padx=(0, 6))
+        ttk.Label(tf2, text="（仅「自定义(MB)」时可用）").pack(
             side="left", padx=(4, 0))
 
         # 归类类别勾选
@@ -661,6 +686,7 @@ class OrganizerApp:
         files = collect_sources(root, include_media=False, scan_all=False,
                                 recursive=recursive)
         files = self._apply_time_filter(files)
+        files = self._apply_size_filter(files)
         if not files:
             self.master.after(0, self._on_scan_empty, root)
             return
@@ -1168,8 +1194,16 @@ class OrganizerApp:
     def _on_scheme_change(self, *a):
         if self.scheme.get() == "自定义模板":
             self.tmpl_entry.configure(state="normal")
+            self._update_template_preview()
         else:
             self.tmpl_entry.configure(state="disabled")
+            self.tmpl_preview.configure(text="")
+
+    def _on_size_filter_change(self, *a):
+        if self.size_filter.get() == "自定义(MB)":
+            self.min_mb_entry.configure(state="normal")
+        else:
+            self.min_mb_entry.configure(state="disabled")
 
     def _on_time_range_change(self, *a):
         if self.time_range.get() == "自定义":
@@ -1222,6 +1256,55 @@ class OrganizerApp:
             self.log("[FILTER] 时间范围「%s」已过滤 %d 个文件，剩余 %d 个"
                      % (rng, skipped, len(out)))
         return out
+
+    def _apply_size_filter(self, files):
+        """按选择的文件大小下限过滤，返回过滤后的列表。"""
+        rng = self.size_filter.get()
+        thr = None
+        if rng == "≥1MB":
+            thr = 1 * MB
+        elif rng == "≥10MB":
+            thr = 10 * MB
+        elif rng == "≥100MB":
+            thr = 100 * MB
+        elif rng == "自定义(MB)":
+            s = self.min_mb.get().strip()
+            if not s:
+                return files
+            try:
+                thr = float(s) * MB
+            except ValueError:
+                self.log("[WARN] 自定义最小大小应为数字(MB)，已忽略大小筛选。")
+                return files
+        if thr is None:
+            return files
+        out, skipped = [], 0
+        for p in files:
+            try:
+                sz = os.path.getsize(p)
+            except OSError:
+                continue
+            if sz < thr:
+                skipped += 1
+                continue
+            out.append(p)
+        if skipped:
+            self.log("[FILTER] 大小筛选「≥%s」已过滤 %d 个文件，剩余 %d 个"
+                     % (human(thr), skipped, len(out)))
+        return out
+
+    def _update_template_preview(self):
+        """在自定义模板输入框下方实时显示示例路径。"""
+        if self.scheme.get() != "自定义模板":
+            self.tmpl_preview.configure(text="")
+            return
+        tmpl = self.tmpl.get().strip()
+        if not tmpl:
+            self.tmpl_preview.configure(text="（请输入模板）")
+            return
+        sample = build_from_template(tmpl, "文档", "2026-03",
+                                    datetime.now().timestamp(), "示例文件.pdf")
+        self.tmpl_preview.configure(text="示例 → " + sample.replace("\\", "/"))
 
 
 
