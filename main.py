@@ -14,6 +14,7 @@
 - v1.6.0：新增「按修改时间筛选」（最近7/30/90天、今年、自定义日期区间）与「输出目录结构自定义」（按类型/月份/年份/组合 + 自定义路径模板如 {type}/{yyyy}/{mm}）。
 - v1.7.0：新增「按文件大小筛选」（全部/≥1MB/≥10MB/≥100MB/自定义MB）与自定义模板「实时路径预览」。
 - v1.8.0：新增「检查更新」——启动后静默查询 GitHub Releases 最新版本，有新版本时状态栏提示；点「检查更新」显示下载链接（纯本地 urllib 查询，无依赖、不收集信息）。
+- v1.9.0：简化「输出目录结构」选择，去掉模板令牌/自定义模板，改为直白的固定选项（按文件类型/按月份/按年份/按类型+月份/按类型+年份/按年份+月份/按类型+年份+月份），并实时显示整理示例。
 """
 import os
 import re
@@ -27,7 +28,7 @@ import urllib.request
 from datetime import datetime
 
 # 当前版本与更新检查仓库（公开 Release）
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.9.0"
 UPDATE_REPO = "oracis/wechat-file-organizer-gui"
 
 try:
@@ -53,15 +54,15 @@ for _cat, _exts in CATEGORIES.items():
     for _e in _exts:
         EXT_TO_CAT[_e] = _cat
 
-# 归类方式：界面显示名 -> 内部键
+# 整理方式：界面显示名 -> 内部键（去掉程序员风格的模板令牌，只留直白选项）
 SCHEME_LABELS = {
-    "按类型": "type",
+    "按文件类型": "type",
     "按月份": "month",
     "按年份": "year",
     "按类型+月份": "type-month",
     "按类型+年份": "type-year",
     "按年份+月份": "year-month",
-    "自定义模板": "custom",
+    "按类型+年份+月份": "type-year-month",
 }
 
 # 扫描筛选：时间范围
@@ -69,9 +70,6 @@ TIME_RANGES = ["全部", "最近7天", "最近30天", "最近90天", "今年", "
 
 # 扫描筛选：文件大小
 SIZE_FILTERS = ["全部", "≥1MB", "≥10MB", "≥100MB", "自定义(MB)"]
-
-# 自定义路径模板令牌（如 {type}/{yyyy}/{mm}）
-TEMPLATE_TOKEN_RE = re.compile(r"\{([^}]+)\}")
 
 # Tk 的 PhotoImage 能直接显示的常见图片格式（jpg 需 PIL，故回退到系统打开）
 IMAGE_PREVIEW_EXTS = {".png", ".gif", ".bmp", ".tiff", ".tif"}
@@ -319,42 +317,6 @@ def collect_sources(root, include_media=False, scan_all=False, recursive=False):
     return files
 
 
-def build_from_template(tmpl, cat, month, mtime, fname):
-    """按自定义模板生成相对目录结构。
-
-    支持令牌：{type}/{cat} 类别、{month} YYYY-MM、{year} YYYY、
-    {yyyy} 年份4位、{yy} 年份2位、{mm} 月份、{dd} 日、{ext} 扩展名(无点)。
-    其余字符原样保留。非法/危险片段会被清洗。
-    """
-    year = month.split("-")[0] if "-" in month else "未知"
-    mm = month.split("-")[1] if "-" in month else ""
-    try:
-        dt = datetime.fromtimestamp(mtime)
-        yyyy = dt.strftime("%Y"); yy = dt.strftime("%y")
-        d_mm = dt.strftime("%m"); d_dd = dt.strftime("%d")
-    except OSError:
-        yyyy = year; yy = year[-2:] if len(year) >= 2 else year
-        d_mm = mm; d_dd = ""
-    _, ext = os.path.splitext(fname)
-    table = {
-        "type": cat, "cat": cat, "month": month, "year": year,
-        "yyyy": yyyy, "yy": yy, "mm": d_mm, "dd": d_dd,
-        "ext": ext.lstrip("."),
-    }
-    parsed = TEMPLATE_TOKEN_RE.sub(lambda m: table.get(m.group(1).lower(), m.group(0)), tmpl)
-    # 清洗：去掉驱动盘符、前导分隔符、.. 等危险片段
-    parts = []
-    for seg in re.split(r"[/\\]", parsed):
-        seg = seg.strip()
-        if not seg or seg in (".", ".."):
-            continue
-        seg = re.sub(r"^[A-Za-z]:", "", seg)
-        parts.append(seg)
-    if not parts:
-        parts = [fname]
-    return os.path.join(*parts)
-
-
 def preset_rel(key, cat, month, fname):
     year = month.split("-")[0] if "-" in month else "未知"
     if key == "type":
@@ -369,6 +331,8 @@ def preset_rel(key, cat, month, fname):
         parts = [cat, year]
     elif key == "year-month":
         parts = [year, month]
+    elif key == "type-year-month":
+        parts = [cat, year, month]
     else:
         parts = [cat]
     return os.path.join(*parts, fname)
@@ -405,11 +369,10 @@ class OrganizerApp:
 
         self.source_dir = tk.StringVar()
         self.dest_dir = tk.StringVar()
-        self.scheme = tk.StringVar(value="按类型")
+        self.scheme = tk.StringVar(value="按文件类型")
         self.dedupe = tk.BooleanVar(value=False)
         self.deep_scan = tk.BooleanVar(value=False)
         self.time_range = tk.StringVar(value="全部")
-        self.tmpl = tk.StringVar(value="{type}/{yyyy}/{mm}")
         self.date_from = tk.StringVar()
         self.date_to = tk.StringVar()
         self.size_filter = tk.StringVar(value="全部")
@@ -439,35 +402,21 @@ class OrganizerApp:
         # 设置
         f_set = ttk.LabelFrame(self.master, text="归类设置")
         f_set.pack(fill="x", **pad)
-        ttk.Label(f_set, text="归类方式:").pack(side="left", padx=(8, 4), pady=8)
-        cb = ttk.Combobox(f_set, textvariable=self.scheme, width=20, state="readonly")
+        line1 = ttk.Frame(f_set)
+        line1.pack(fill="x", padx=8, pady=(4, 0))
+        ttk.Label(line1, text="整理方式:").pack(side="left", padx=(0, 4))
+        cb = ttk.Combobox(line1, textvariable=self.scheme, width=22,
+                          state="readonly")
         cb["values"] = tuple(SCHEME_LABELS.keys())
         cb.bind("<<ComboboxSelected>>", self._on_scheme_change)
-        cb.pack(side="left", padx=(0, 12), pady=8)
-        ttk.Checkbutton(f_set, text="去重（相同内容只保留一份）", variable=self.dedupe).pack(
-            side="left", padx=(4, 8), pady=8)
-        ttk.Checkbutton(f_set, text="兼容模式（递归扫描任意目录）",
-                        variable=self.deep_scan).pack(side="left", padx=(4, 8), pady=8)
-
-        # 输出目录结构（自定义模板）
-        f_struct = ttk.LabelFrame(
-            self.master,
-            text="输出目录结构（选「自定义模板」可在下方输入路径模板）")
-        f_struct.pack(fill="x", **pad)
-        ttk.Label(
-            f_struct,
-            text="模板令牌：{type} 类别  {year}/{yyyy} 年  {mm} 月  {dd} 日  {ext} 扩展名（无点）   例：{type}/{yyyy}/{mm}").pack(
-            anchor="w", padx=10, pady=(4, 0))
-        fe = ttk.Frame(f_struct)
-        fe.pack(fill="x", padx=10, pady=(2, 8))
-        ttk.Label(fe, text="自定义模板:").pack(side="left", padx=(0, 4))
-        self.tmpl_entry = ttk.Entry(fe, textvariable=self.tmpl, width=42,
-                                    state="disabled")
-        self.tmpl_entry.pack(side="left", fill="x", expand=True)
-        self.tmpl_entry.bind("<KeyRelease>",
-                             lambda e: self._update_template_preview())
-        self.tmpl_preview = ttk.Label(f_struct, text="", foreground="#888888")
-        self.tmpl_preview.pack(anchor="w", padx=10, pady=(0, 8))
+        cb.pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(line1, text="去重（相同内容只保留一份）",
+                        variable=self.dedupe).pack(side="left", padx=(4, 8))
+        ttk.Checkbutton(line1, text="兼容模式（递归扫描任意目录）",
+                        variable=self.deep_scan).pack(side="left", padx=(4, 8))
+        self.scheme_preview = ttk.Label(
+            f_set, text="", foreground="#666666", wraplength=900)
+        self.scheme_preview.pack(anchor="w", padx=10, pady=(2, 6))
 
         # 扫描筛选：时间范围
         f_filter = ttk.LabelFrame(
@@ -634,6 +583,9 @@ class OrganizerApp:
         self.status = tk.StringVar(value="就绪")
         ttk.Label(self.master, textvariable=self.status, relief="sunken",
                   anchor="w").pack(fill="x", side="bottom")
+
+        # 初始化整理方式示例
+        self._update_scheme_preview()
 
         # 启动后静默检查更新（仅状态栏提示，不打扰）
         self.master.after(2000, lambda: self._check_update(verbose=False))
@@ -878,7 +830,6 @@ class OrganizerApp:
 
     def _do_apply(self, dest):
         label = self.scheme.get()
-        template = self.tmpl.get().strip()
         dedupe = self.dedupe.get()
         os.makedirs(dest, exist_ok=True)
         used = set()
@@ -894,12 +845,8 @@ class OrganizerApp:
                 continue
             seen_hash.add(r["hash"])
             fname = os.path.basename(r["path"])
-            if label == "自定义模板":
-                rel = build_from_template(template or "{type}/{ext}", r["cat"],
-                                          r["month"], r["mtime"], fname)
-            else:
-                rel = preset_rel(SCHEME_LABELS.get(label, "type"), r["cat"],
-                                 r["month"], fname)
+            rel = preset_rel(SCHEME_LABELS.get(label, "type"), r["cat"],
+                             r["month"], fname)
             dp = dest_path(dest, rel, used)
             try:
                 os.makedirs(os.path.dirname(dp), exist_ok=True)
@@ -1205,12 +1152,7 @@ class OrganizerApp:
 
     # ---------- 界面联动 ----------
     def _on_scheme_change(self, *a):
-        if self.scheme.get() == "自定义模板":
-            self.tmpl_entry.configure(state="normal")
-            self._update_template_preview()
-        else:
-            self.tmpl_entry.configure(state="disabled")
-            self.tmpl_preview.configure(text="")
+        self._update_scheme_preview()
 
     def _on_size_filter_change(self, *a):
         if self.size_filter.get() == "自定义(MB)":
@@ -1306,18 +1248,29 @@ class OrganizerApp:
                      % (human(thr), skipped, len(out)))
         return out
 
-    def _update_template_preview(self):
-        """在自定义模板输入框下方实时显示示例路径。"""
-        if self.scheme.get() != "自定义模板":
-            self.tmpl_preview.configure(text="")
-            return
-        tmpl = self.tmpl.get().strip()
-        if not tmpl:
-            self.tmpl_preview.configure(text="（请输入模板）")
-            return
-        sample = build_from_template(tmpl, "文档", "2026-03",
-                                    datetime.now().timestamp(), "示例文件.pdf")
-        self.tmpl_preview.configure(text="示例 → " + sample.replace("\\", "/"))
+    def _update_scheme_preview(self):
+        """根据当前选择的整理方式，显示一个普通用户能看懂的示例路径。"""
+        label = self.scheme.get()
+        key = SCHEME_LABELS.get(label, "type")
+        sample = preset_rel(key, "文档", "2026-03", "文件名.pdf")
+        if key == "type":
+            hint = "所有文件会按类型分文件夹，如"
+        elif key == "month":
+            hint = "所有文件会按月份分文件夹，如"
+        elif key == "year":
+            hint = "所有文件会按年份分文件夹，如"
+        elif key == "type-month":
+            hint = "先按类型、再按月份分文件夹，如"
+        elif key == "type-year":
+            hint = "先按类型、再按年份分文件夹，如"
+        elif key == "year-month":
+            hint = "先按年份、再按月份分文件夹，如"
+        elif key == "type-year-month":
+            hint = "先按类型、再按年份、最后按月份分文件夹，如"
+        else:
+            hint = "文件会被整理到"
+        self.scheme_preview.configure(
+            text="%s：%s" % (hint, sample.replace("\\", "/")))
 
     # ---------- 更新检查 ----------
     @staticmethod
