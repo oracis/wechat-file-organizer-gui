@@ -7,6 +7,20 @@
 
 **安全底线（各版本不变）**：扫描只读；归类只复制；清理原始文件一律移入回收站（可恢复），绝不永久删除微信源文件。
 
+## [1.16.0] - 2026-09-03
+
+### 新增
+- **macOS 支持（初步移植）**：新增平台抽象层，macOS 上可探测新版微信沙盒目录（`~/Library/Containers/com.tencent.xinWeChat/.../<版本>/<账号哈希>`），按 `MessageTemp/<会话>/File|Image|Video|Audio` 结构收集接收文件；多版本/多账号合并扫描与「微信账号」列自动生效。
+
+### 变更
+- **回收站删除加固（安全）**：非 Windows 平台不再静默回退为「永久删除」——macOS 走 Finder 移入废纸篓（跨卷/同名冲突由系统处理），Linux 明确跳过不删；Windows 侧删除失败同样只报错、绝不误删源文件。所有平台清理失败均计入 failures 由界面提示。
+
+### 技术
+- 平台标识 `PLATFORM`（win/mac/linux）与公共打开函数 `open_in_system()`（mac `open` / Linux `xdg-open` / Windows `os.startfile`），替换原 6 处 `os.startfile` 调用。
+- macOS 沙盒探测 `_mac_wechat_roots()`、账号目录 BFS 发现、`collect_mac_files()` 类型目录收集；「微信加密文件」类在 mac 恒为空。
+- Windows 无头回归 + 平台分支单测（mock mac/linux，27 项）全部通过。
+- CI 新增 macOS job（GitHub Actions `macos-latest`，Apple Silicon）：PyInstaller 构建 `.app`，`pkgbuild` 产**未签名 .pkg 安装包**、`ditto` 产 `.zip`，自动上传到 Release（PyInstaller 无法交叉编译，macOS 包必须在 macOS 上构建）。
+
 ## [1.15.0] - 2026-09-03
 
 ### 新增
