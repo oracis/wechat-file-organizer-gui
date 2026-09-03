@@ -15,6 +15,7 @@
 - v1.7.0：新增「按文件大小筛选」（全部/≥1MB/≥10MB/≥100MB/自定义MB）与自定义模板「实时路径预览」。
 - v1.8.0：新增「检查更新」——启动后静默查询 GitHub Releases 最新版本，有新版本时状态栏提示；点「检查更新」显示下载链接（纯本地 urllib 查询，无依赖、不收集信息）。
 - v1.9.0：简化「输出目录结构」选择，去掉模板令牌/自定义模板，改为直白的固定选项（按文件类型/按月份/按年份/按类型+月份/按类型+年份/按年份+月份/按类型+年份+月份），并实时显示整理示例。
+- v1.10.0：启动后自动扫描（微信目录有效时），并顶部显示三步使用提示，让普通用户打开即见结果。
 """
 import os
 import re
@@ -28,7 +29,7 @@ import urllib.request
 from datetime import datetime
 
 # 当前版本与更新检查仓库（公开 Release）
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.10.0"
 UPDATE_REPO = "oracis/wechat-file-organizer-gui"
 
 try:
@@ -391,6 +392,14 @@ class OrganizerApp:
     def _build_ui(self):
         pad = {"padx": 10, "pady": 5}
 
+        # 顶部友好提示横幅（不玩术语，普通用户一看就懂）
+        banner = tk.Label(
+            self.master,
+            text="三步完成整理：① 扫描出微信文件 → ② 勾选想搬的类别 → ③ 点「一键归类」复制到桌面（微信原文件不会动）。",
+            relief="groove", borderwidth=1, bg="#E8F0FE", fg="#1a1a1a",
+            font=("Microsoft YaHei UI", 10), anchor="w", padx=10, pady=8)
+        banner.pack(fill="x", **pad)
+
         # 源目录
         f_src = ttk.LabelFrame(self.master, text="微信文件目录")
         f_src.pack(fill="x", **pad)
@@ -589,6 +598,11 @@ class OrganizerApp:
 
         # 启动后静默检查更新（仅状态栏提示，不打扰）
         self.master.after(2000, lambda: self._check_update(verbose=False))
+
+        # 启动后自动扫描（源目录有效时才扫，让用户打开就看到结果）
+        src = self.source_dir.get().strip()
+        if src and os.path.isdir(src):
+            self.master.after(1200, self.scan)
 
     def log(self, msg):
         self.logbox.configure(state="normal")
