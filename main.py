@@ -16,6 +16,7 @@
 - v1.8.0：新增「检查更新」——启动后静默查询 GitHub Releases 最新版本，有新版本时状态栏提示；点「检查更新」显示下载链接（纯本地 urllib 查询，无依赖、不收集信息）。
 - v1.9.0：简化「输出目录结构」选择，去掉模板令牌/自定义模板，改为直白的固定选项（按文件类型/按月份/按年份/按类型+月份/按类型+年份/按年份+月份/按类型+年份+月份），并实时显示整理示例。
 - v1.10.0：启动后自动扫描（微信目录有效时），并顶部显示三步使用提示，让普通用户打开即见结果。
+- v1.11.0：一键归类完成后自动打开输出文件夹；兼容模式标签改为更直白的「扫描整个文件夹（适合新版微信）」。
 """
 import os
 import re
@@ -29,7 +30,7 @@ import urllib.request
 from datetime import datetime
 
 # 当前版本与更新检查仓库（公开 Release）
-APP_VERSION = "1.10.0"
+APP_VERSION = "1.11.0"
 UPDATE_REPO = "oracis/wechat-file-organizer-gui"
 
 try:
@@ -421,7 +422,7 @@ class OrganizerApp:
         cb.pack(side="left", padx=(0, 12))
         ttk.Checkbutton(line1, text="去重（相同内容只保留一份）",
                         variable=self.dedupe).pack(side="left", padx=(4, 8))
-        ttk.Checkbutton(line1, text="兼容模式（递归扫描任意目录）",
+        ttk.Checkbutton(line1, text="扫描整个文件夹（适合新版微信）",
                         variable=self.deep_scan).pack(side="left", padx=(4, 8))
         self.scheme_preview = ttk.Label(
             f_set, text="", foreground="#666666", wraplength=900)
@@ -888,6 +889,12 @@ class OrganizerApp:
             self.log("      因未勾选类别跳过 %d 个文件" % skipped_cat)
         self.log("源文件未做任何改动。如需清理，可在「归类副本」页右键删除副本，或点「清空归类文件夹」。")
         messagebox.showinfo("完成", "已复制 %d 个文件到:\n%s" % (copied, dest))
+        # 归类完成后自动打开输出文件夹，让用户立刻看到结果
+        try:
+            if os.path.isdir(dest):
+                os.startfile(dest)
+        except Exception as e:
+            self.log("[WARN] 无法自动打开输出文件夹: " + str(e))
 
     # ---------- 预览 / 打开 ----------
     def _rec_from_iid(self, iid, tree=None):
