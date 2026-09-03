@@ -10,8 +10,10 @@
 
 ## 下载与使用
 
-1. 到 [Releases](../../releases) 下载 `WeChatFileOrganizer.exe`（单文件，免安装）。
-2. 双击运行（Windows 10/11）。
+1. 到 [Releases](../../releases) 下载对应平台的安装包：
+   - **Windows**：`WeChatFileOrganizer.exe`（单文件，免安装）；
+   - **macOS（Apple Silicon）**：`WeChatFileOrganizer-macOS-arm64.pkg`（安装到「应用程序」）或 `WeChatFileOrganizer-macOS-arm64.zip`（解压即用）。
+2. 双击运行（Windows 10/11 / macOS 12+）。
 3. 程序会**自动探测**微信文件目录并填到「① 选择微信文件所在的文件夹」（兼容 `WeChat Files` / `Weixin Files` / `xwechat_files` 及自定义路径）；若没找到，该处会**红色提示**你点「换个文件夹」手动选。
 4. **输出目录默认就是桌面「微信文件整理」**，无需手动填。
 5. 微信目录填好后，程序会**自动扫描**并在「③ 预览并整理」处显示「将整理 N 个文件，共 X」（也可随时点「重新扫描」刷新）。
@@ -37,6 +39,15 @@
 - **方式三（彻底信任）**：若你担心，可改用本仓库源码自行打包（见下方「自己重新打包」），从自己电脑生成的 exe 不会触发该提示。
 
 > 说明：Microsoft 从 2024 年起，即便购买 EV 代码签名证书也不再能「一键消除」SmartScreen 提示，需靠下载量积累信誉。**好消息**：本项目已把 [SignPath Foundation](https://signpath.org/) 的**免费开源代码签名**接入 CI（见 `docs/windows-code-signing.md`）。只要按文档申请到免费证书、在仓库填入 4 个密钥/变量，之后每次发版（打 tag 推上去）产出的 exe 都会**自动带上 Authenticode 签名**，SmartScreen 弹窗随之消失。在配置完成前，下面的方式一/二/三仍可正常打开未签名版本。
+
+### macOS 首次运行提示
+
+macOS 包（pkg/zip）**未做 Apple 签名与公证**（开发者证书 $99/年，暂未购买），首次打开会被 Gatekeeper 拦截，这**不是程序有问题**，任选其一：
+
+- **方式一**：把 app 放进「应用程序」后，**右键 → 打开 → 再点「打开」**（只需一次）。
+- **方式二（彻底）**：终端执行 `xattr -cr /Applications/WeChatFileOrganizer.app` 后正常双击打开。
+
+> macOS 版会自动探测新版 Mac 微信的沙盒目录（`~/Library/Containers/com.tencent.xinWeChat/...`），按 `MessageTemp/<会话>` 结构收集接收文件；清理原文件走「Finder 移入废纸篓」（可恢复）。当前包为 **Apple Silicon（arm64）** 版，Intel Mac 暂不支持。
 
 ---
 
@@ -132,15 +143,25 @@ build\venv\Scripts\pyinstaller --onefile --windowed --name WeChatFileOrganizer -
 
 > 注意：WorkBuddy 自带的精简 Python 没有 tkinter，打包请用自己的系统 Python。
 
+**macOS 本地打包**（需真 Mac，PyInstaller 无法在 Windows 上交叉编译）：
+
+```bash
+python3 -m pip install pyinstaller pillow
+pyinstaller --windowed --name WeChatFileOrganizer --exclude-module numpy main.py
+# 产物 dist/WeChatFileOrganizer.app；如需安装包：
+pkgbuild --root dist --identifier com.oracis.wechat-file-organizer \
+  --version 1.16.0 --install-location /Applications WeChatFileOrganizer-macOS-arm64.pkg
+```
+
 ### 自动构建与发布（推荐）
 
-本项目已配置 GitHub Actions（`.github/workflows/build-and-sign.yml`）：在 GitHub 托管的 Windows 上用 PyInstaller 构建单文件 exe，**可选地**经 SignPath 签名后自动建 Release 并上传。
+本项目已配置 GitHub Actions（`.github/workflows/build-and-sign.yml`）：**Windows job** 在 GitHub 托管的 Windows 上用 PyInstaller 构建单文件 exe，可选地经 SignPath 签名后自动建 Release 并上传；**macOS job** 在 GitHub 托管的 macOS（Apple Silicon）上构建 `.app`，并用 `pkgbuild`/`ditto` 产出**未签名的 .pkg 安装包与 .zip**，自动上传到同一个 Release。
 
 发布新版本只需打 tag 推上去：
 
 ```bash
-git tag v1.15.0
-git push origin v1.15.0
+git tag v1.16.0
+git push origin v1.16.0
 ```
 
 也可在 Actions 标签手动 `Run workflow` 并填写版本号。若仓库里还没配置 SignPath 的四个密钥/变量，工作流会自动跳过签名、照常发布**未签名**的 exe，不会中断发布流程（详见 `docs/windows-code-signing.md`）。
@@ -149,6 +170,7 @@ git push origin v1.15.0
 
 ## 更新历史
 
+- **v1.16.0** — **新增 macOS 支持**：自动探测新版 Mac 微信沙盒目录（`~/Library/Containers/com.tencent.xinWeChat/...`），按 `MessageTemp/<会话>/File|Image|Video|Audio` 结构收集接收文件，多版本/多账号合并扫描同样生效；发版新增**未签名的 .pkg 安装包与 .zip**（Apple Silicon arm64，CI 自动构建）。**安全加固**：非 Windows 平台删除原文件不再静默降级为永久删除——macOS 走 Finder 移入废纸篓（可恢复），Linux 明确跳过；Windows 侧删除失败只报错、绝不误删。
 - **v1.15.0** — 新增「**多微信账号合并扫描**」：自动探测电脑上所有微信文件根目录（新版 `xwechat_files` 与旧版 `WeChat Files` 可并存），一次性合并扫描并在顶部显示账号数量、文件清单多出「微信账号」列（单账号时自动隐藏），整理清单.csv 也记录来源账号。新增「**图片内嵌缩略图预览**」：单击图片即在文件清单下方显示缩略图（含原始尺寸/大小/修改时间，支持 jpg/png/gif/bmp/webp，带缓存），双击弹出适配屏幕的大图窗口，可一键用系统程序打开或打开所在文件夹。
 - **CI 自动构建+签名** — 新增 GitHub Actions 工作流 `build-and-sign.yml`：打 tag 即自动用 PyInstaller 构建，并在配置 SignPath 后自动 Authenticode 签名发布；未配置时自动发布未签名版本，发布流程不中断。详见 `docs/windows-code-signing.md`。
 - **v1.14.0** — 界面重做为「三步向导式」单屏布局：① 选微信文件夹 ② 勾选要整理的类型 ③ 预览并一键「开始整理」。进阶功能（7 种整理方式 / 去重 / 扫描范围 / 时间 / 大小筛选 / 文件清单 / 日志）默认收进可折叠区，小白打开即用；大号主按钮、顶部蓝色品牌横幅、未探测到目录时红字引导，整体更直白不绕。功能全部保留。
