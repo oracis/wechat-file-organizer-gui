@@ -110,14 +110,57 @@ def sha256_of(p, chunk=1 << 20):
 
 
 # ---------- 路径发现 ----------
+def _scan_for_wechat(root, max_depth=4):
+    """在 root 下有限深度搜索微信文件根目录（含 FileStorage 或 msg 特征目录）。"""
+    if not os.path.isdir(root):
+        return None
+    for dirpath, dirnames, _ in os.walk(root):
+        depth = dirpath[len(root):].count(os.sep)
+        if depth > max_depth:
+            dirnames[:] = []
+            continue
+        for marker in ("FileStorage", "msg"):
+            if marker in dirnames:
+                return dirpath
+    return None
+
+
 def find_wechat_files_dir():
+    """自动探测微信文件目录，兼容传统与新版/自定义结构。
+
+    返回最浅的『微信根目录』（如 .../xwechat_files 或 .../wxid_xxx），
+    供 GUI 直接填入源目录框；扫描时会自动启用兼容模式。
+    """
+    # 1. 环境变量（高级用户手动指定）
     env = os.environ.get("WECHAT_FILES_DIR")
     if env and os.path.isdir(env):
         return env
-    base = os.path.expanduser(os.path.join("~", "Documents", "WeChat Files"))
-    if os.path.isdir(base):
-        return base
+    home = os.path.expanduser("~")
+    # 2. 常见候选目录名（传统 / 新版 / 自定义）
+    candidates = [
+        os.path.join(home, "Documents", "WeChat Files"),
+        os.path.join(home, "Documents", "Weixin Files"),
+        os.path.join(home, "Documents", "xwechat_files"),
+        os.path.join(home, "WeChat Files"),
+        os.path.join(home, "Weixin Files"),
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            return c
+    # 3. 有限深度扫描文档目录，按微信特征目录定位
+    docs = os.path.join(home, "Documents")
+    found = _scan_for_wechat(docs, max_depth=4)
+    if found:
+        return found
     return None
+
+
+def default_output_dir():
+    """默认输出目录：桌面下的『微信文件整理』，普通用户最容易找到。"""
+    desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+    if os.path.isdir(desktop):
+        return os.path.join(desktop, "微信文件整理")
+    return os.path.join(os.path.expanduser("~"), "Documents", "微信文件整理")
 
 
 def discover_accounts(root):
@@ -221,9 +264,7 @@ class OrganizerApp:
 
         detected = find_wechat_files_dir() or ""
         self.source_dir.set(detected)
-        if detected:
-            self.dest_dir.set(os.path.join(
-                os.path.dirname(os.path.abspath(detected)), "WeChatFiles_Organized"))
+        self.dest_dir.set(default_output_dir())
 
         self._build_ui()
 
@@ -310,11 +351,12 @@ class OrganizerApp:
         self.logbox.configure(state="disabled")
 
     def browse_source(self):
-        d = filedialog.askdirectory(title="选择微信 WeChat Files 目录")
+        d = filedialog.askdirectory(title="选择微信文件目录")
         if d:
             self.source_dir.set(d)
-            self.dest_dir.set(os.path.join(
-                os.path.dirname(os.path.abspath(d)), "WeChatFiles_Organized"))
+            cur = self.dest_dir.get().strip()
+            if not cur or cur == default_output_dir():
+                self.dest_dir.set(default_output_dir())
             self.apply_btn.configure(state="disabled")
             self.tree.delete(*self.tree.get_children())
 
