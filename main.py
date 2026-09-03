@@ -25,6 +25,9 @@
 - v1.15.0：新增「多微信账号合并扫描」——自动探测电脑上所有微信文件根目录（新版 xwechat_files 与旧版
           WeChat Files 可同时存在），合并扫描并在文件清单中标注每个文件属于哪个账号；
           新增「图片内嵌缩略图预览」——用 Pillow 解码，选中图片即在清单下方显示缩略图，双击可看大图（支持 jpg）。
+- v1.16.0：macOS 初步移植——平台抽象（回收站 mac 走废纸篓 / Linux 明确跳过 / 打开方式三平台分派，
+           Windows 侧删除失败不再静默永久删除）；新增 macOS 微信沙盒目录探测与账号文件收集
+          （Message/MessageTemp 类型目录），多版本/多账号合并扫描自动生效；Windows 行为不变。
 """
 import os
 import re
@@ -32,14 +35,19 @@ import sys
 import time
 import json
 import shutil
+import subprocess
 import threading
 import unicodedata
 import urllib.request
 from datetime import datetime
 
 # 当前版本与更新检查仓库（公开 Release）
-APP_VERSION = "1.15.0"
+APP_VERSION = "1.16.0"
 UPDATE_REPO = "oracis/wechat-file-organizer-gui"
+
+# 平台标识：win / mac / linux（macOS 微信沙盒目录、废纸篓调用等据此分派）
+PLATFORM = "mac" if sys.platform == "darwin" else (
+    "win" if os.name == "nt" else "linux")
 
 try:
     import tkinter as tk
@@ -125,6 +133,22 @@ SKIP_EXTS = {
     ".shm", ".wal", ".sqlite", ".sqlitedb",
 }
 
+# macOS 微信沙盒中，MessageTemp 下用户文件的类型子目录（其余视为系统/中间目录过滤）
+MAC_FILE_SUBDIRS = {"File", "Image", "Video", "Audio"}
+# 删除操作在 mac/linux 上的叫法（仅提示文案差异）
+TRASH_LABEL = {"win": "回收站", "mac": "废纸篓", "linux": "废纸篓"}[PLATFORM]
+
+
+def open_in_system(path):
+    """用系统默认程序打开文件或文件夹，跨平台分派。"""
+    path = os.path.normpath(path)
+    if PLATFORM == "mac":
+        subprocess.Popen(["open", path])
+    elif PLATFORM == "linux":
+        subprocess.Popen(["xdg-open", path])
+    else:
+        os.startfile(path)
+
 
 # ---------- 中文宽度对齐 ----------
 def wlen(s):
@@ -176,27 +200,64 @@ def sha256_of(p, chunk=1 << 20):
 
 
 def send_to_recycle_bin(paths):
-    """把文件/目录移入 Windows 回收站（可恢复）。
+    """把文件/目录移入系统回收站（可恢复），跨平台。
 
     返回 (ok, failures)，failures 为 (path, reason) 列表。
-    若无法调用 Shell，则回退为永久删除并给出警告。
-    注意：默认不弹系统确认框（FOF_NOCONFIRMATION），由调用方负责二次确认。
+    - Windows: SHFileOperationW 移入回收站；
+    - macOS:   osascript 调 Finder delete 移入废纸篓；
+    - Linux:   不支持，直接返回失败（绝不永久删除）。
+    原则：任何平台删除失败都只计入 failures，绝不静默回退为永久删除。
+    注意：默认不弹系统确认框，由调用方负责二次确认。
     """
+    paths = [p for p in paths if p and os.path.exists(p)]
+    if not paths:
+        return 0, []
+
+    # ---- Linux：不支持移入废纸篓，跳过而非删除 ----
+    if PLATFORM == "linux":
+        return 0, [(p, "Linux 暂不支持移入%s，已跳过（未删除任何文件）" % TRASH_LABEL)
+                   for p in paths]
+
+    # ---- macOS：osascript 调 Finder delete ----
+    if PLATFORM == "mac":
+        def esc(s):
+            # AppleScript 字符串内转义反斜杠与双引号
+            return s.replace("\\", "\\\\").replace('"', '\\"')
+
+        def run_osa(script):
+            try:
+                r = subprocess.run(["osascript", "-e", script],
+                                   capture_output=True, text=True)
+                return r.returncode == 0, (r.stderr or r.stdout).strip()
+            except Exception as e:      # osascript 不存在等
+                return False, str(e)
+
+        # 一次多选批量删除（跨卷/同名冲突由 Finder 处理），失败再逐条定位
+        items = ", ".join('POSIX file "%s"' % esc(p) for p in paths)
+        ok_all, err = run_osa(
+            'tell application "Finder" to delete {%s}' % items)
+        if ok_all:
+            return len(paths), []
+        ok = 0
+        failures = []
+        for p in paths:
+            ok_one, err_one = run_osa(
+                'tell application "Finder" to delete POSIX file "%s"' % esc(p))
+            if ok_one:
+                ok += 1
+            else:
+                failures.append((p, "移入%s失败: %s" % (TRASH_LABEL, err_one[:200])))
+        return ok, failures
+
+    # ---- Windows：SHFileOperationW ----
     import ctypes
     from ctypes import wintypes
     try:
         shell32 = ctypes.windll.shell32
     except Exception:
-        failures = []
-        for p in paths:
-            try:
-                if os.path.isdir(p):
-                    shutil.rmtree(p)
-                else:
-                    os.remove(p)
-            except OSError as e:
-                failures.append((p, "永久删除失败: " + str(e)))
-        return len(paths) - len(failures), failures
+        # 无法调用 Shell API：绝不永久删除，一律报失败由用户处理
+        return 0, [(p, "无法调用系统%s，已跳过（未删除任何文件）" % TRASH_LABEL)
+                   for p in paths]
 
     class SHFILEOPSTRUCT(ctypes.Structure):
         _fields_ = [
@@ -258,6 +319,11 @@ def find_wechat_files_dir():
     if env and os.path.isdir(env):
         return env
     home = os.path.expanduser("~")
+    if PLATFORM == "mac":
+        # macOS：微信沙盒容器（取最新版本下的账号目录）
+        roots = _mac_wechat_roots()
+        if roots:
+            return roots[0]
     # 2. 常见候选目录名（传统 / 新版 / 自定义）
     candidates = [
         os.path.join(home, "Documents", "WeChat Files"),
@@ -278,7 +344,12 @@ def find_wechat_files_dir():
 
 
 def _is_account_dir(d):
-    """是否为单个微信账号目录（含 msg 或 FileStorage 特征子目录）。"""
+    """是否为单个微信账号目录（含该平台微信的账号特征子目录）。
+
+    Windows 认 msg / FileStorage；macOS 认沙盒结构里的 Message。
+    """
+    if PLATFORM == "mac":
+        return os.path.isdir(os.path.join(d, "Message"))
     return (os.path.isdir(os.path.join(d, "msg"))
             or os.path.isdir(os.path.join(d, "FileStorage")))
 
@@ -309,6 +380,38 @@ def _scan_for_wechat_all(root, max_depth=4, limit=8):
     return found
 
 
+def _mac_wechat_roots():
+    """返回 macOS 微信沙盒『账号目录』列表（含 Message 特征，按版本号倒序）。
+
+    路径：~/Library/Containers/com.tencent.xinWeChat/Data/Library/Application
+          Support/com.tencent.xinWeChat/<版本号>/<账号哈希>
+    版本目录可能多个（历史版本残留），只认含 Message 的账号目录；非 mac 或
+    目录不存在时返回 []。
+    """
+    if PLATFORM != "mac":
+        return []
+    base = os.path.expanduser(
+        "~/Library/Containers/com.tencent.xinWeChat/Data/Library/"
+        "Application Support/com.tencent.xinWeChat")
+    if not os.path.isdir(base):
+        return []
+    roots = []
+    try:
+        # 版本号目录：倒序保证新版本排前
+        for ver in sorted(os.listdir(base), reverse=True):
+            vdir = os.path.join(base, ver)
+            if not os.path.isdir(vdir):
+                continue
+            for acct in os.listdir(vdir):
+                d = os.path.join(vdir, acct)
+                if os.path.isdir(d) and os.path.isdir(os.path.join(d, "Message")):
+                    if d not in roots:
+                        roots.append(d)
+    except OSError:
+        pass
+    return roots
+
+
 def find_all_wechat_dirs():
     """探测电脑上所有微信文件根目录。
 
@@ -328,6 +431,11 @@ def find_all_wechat_dirs():
     env = os.environ.get("WECHAT_FILES_DIR")
     if env:
         add(env)
+    if PLATFORM == "mac":
+        # macOS：多个版本/多个账号哈希并存的沙盒账号目录
+        for d in _mac_wechat_roots():
+            add(d)
+        return out
     home = os.path.expanduser("~")
     for name in ("WeChat Files", "Weixin Files", "xwechat_files"):
         add(os.path.join(home, "Documents", name))
@@ -339,13 +447,42 @@ def find_all_wechat_dirs():
 
 
 def discover_account_dirs(root):
-    """返回 root 下的微信账号目录列表（新旧结构均可）。"""
-    accounts = []
+    """返回 root 下的微信账号目录列表（新旧结构均可）。
+
+    macOS 语义：沙盒层级深（容器/Data/Library/Application Support/
+    com.tencent.xinWeChat/<版本>/<账号哈希>），BFS 下探最多 6 层找齐所有
+    含 Message 特征的账号目录；Windows 语义：根下账号目录一层，root 本身是
+    账号时直接返回。
+    """
     if not root or not os.path.isdir(root):
-        return accounts
+        return []
     root = os.path.normpath(root)
     if _is_account_dir(root):
-        accounts.append(root)
+        return [root]
+    accounts = []
+    if PLATFORM == "mac":
+        from collections import deque
+        q = deque([(root, 0)])
+        seen = set()
+        while q:
+            d, depth = q.popleft()
+            if d in seen:
+                continue
+            seen.add(d)
+            if _is_account_dir(d):
+                if d not in accounts:
+                    accounts.append(d)
+                continue                # 账号目录内不再下探
+            if depth >= 6:
+                continue
+            try:
+                for name in sorted(os.listdir(d)):
+                    dd = os.path.join(d, name)
+                    if os.path.isdir(dd):
+                        q.append((dd, depth + 1))
+            except OSError:
+                pass
+        return accounts
     try:
         for name in sorted(os.listdir(root)):
             d = os.path.join(root, name)
@@ -435,14 +572,66 @@ def recursive_collect(root):
     return files
 
 
+def collect_mac_files(acct_dir, include_media=False):
+    """收集 macOS 微信账号目录下 MessageTemp 中的用户文件。
+
+    mac 结构：<账号>/Message/MessageTemp/<会话>/File|Image|Video|Audio/...
+    MessageTemp 下是各会话目录，会话目录内才是 File/Image/Video/Audio 类型目录。
+    只收四类类型目录下的文件；散落在会话目录里的零散文件（多为系统数据）忽略。
+    include_media=False（默认）只收 File（对应 Windows『收到的文件』）；
+    include_media=True 时 Image/Video/Audio 一并计入。
+    """
+    files = []
+    msg_temp = os.path.join(acct_dir, "Message", "MessageTemp")
+    if not os.path.isdir(msg_temp):
+        return files
+    keep = set(MAC_FILE_SUBDIRS) if include_media else {"File"}
+    walked = set()
+
+    def collect_under(p):
+        # p 为类型目录：递归收集其下全部文件
+        try:
+            for dp, _, fnames in os.walk(p):
+                for fn in fnames:
+                    ext = os.path.splitext(fn)[1].lower()
+                    if ext in SKIP_EXTS:
+                        continue
+                    files.append(os.path.join(dp, fn))
+        except OSError:
+            pass
+
+    def descend(d):
+        # 递归下探：命中类型目录即整棵收集，否则继续向下找
+        if d in walked:
+            return
+        walked.add(d)
+        try:
+            entries = sorted(os.listdir(d))
+        except OSError:
+            return
+        for e in entries:
+            p = os.path.join(d, e)
+            if not os.path.isdir(p):
+                continue
+            if e in keep:
+                collect_under(p)
+            else:
+                descend(p)
+
+    descend(msg_temp)
+    return files
+
+
 def collect_wechat_internal(root):
     """收集微信『加密存储的内部文件』：收藏（business/favorite/data）与聊天附件
     （msg/attach/*.dat）。这些文件被微信私有加密，原文件名与内容均不可直接读取，
     复制出来通常无法直接打开；本工具仅将它们列出/备份，不做解密。
 
-    返回文件路径列表。
+    返回文件路径列表。macOS 微信不采用该结构，直接返回空。
     """
     result = []
+    if PLATFORM == "mac":
+        return result
     if not os.path.isdir(root):
         return result
 
@@ -486,6 +675,13 @@ def collect_sources(root, include_media=False, scan_all=False, recursive=False):
             files = [f for f in files
                      if os.path.splitext(f)[1].lower() != ".dat"]
         return files
+    if PLATFORM == "mac":
+        # mac：MessageTemp/<会话>/File|Image|Video|Audio 专用收集路径；
+        # scan_all 在 mac 上等效于 include_media（媒体一并计入）
+        out = []
+        for acct in (discover_account_dirs(root) or [root]):
+            out += collect_mac_files(acct, include_media or scan_all)
+        return out
     files = []
     seen = set()
     targets = discover_accounts(root)
@@ -1482,7 +1678,7 @@ class OrganizerApp:
         # 归类完成后自动打开输出文件夹，让用户立刻看到结果
         try:
             if os.path.isdir(dest):
-                os.startfile(dest)
+                open_in_system(dest)
         except Exception as e:
             self.log("[WARN] 无法自动打开输出文件夹: " + str(e))
 
@@ -1524,20 +1720,20 @@ class OrganizerApp:
         else:
             # 其他类型用系统默认程序打开（查看）
             try:
-                os.startfile(path)
+                open_in_system(path)
             except Exception as e:
                 self.log("[WARN] 无法打开预览: " + str(e))
 
     # ---------- 图片缩略图 / 大图预览 ----------
     def _open_with_system(self, path):
         try:
-            os.startfile(path)
+            open_in_system(path)
         except Exception as e:
             self.log("[WARN] 无法用系统程序打开: " + str(e))
 
     def _open_folder_of(self, path):
         try:
-            os.startfile(os.path.dirname(path))
+            open_in_system(os.path.dirname(path))
         except Exception as e:
             self.log("[WARN] 无法打开所在文件夹: " + str(e))
 
@@ -1748,7 +1944,7 @@ class OrganizerApp:
         path = rec["dst"] if tree is self.tree_outputs else rec["path"]
         d = os.path.dirname(path)
         try:
-            os.startfile(d)
+            open_in_system(d)
         except Exception as e:
             self.log("[WARN] 无法打开文件夹: " + str(e))
 
@@ -2281,7 +2477,7 @@ class OrganizerApp:
             messagebox.showinfo("提示", "输出文件夹尚不存在，请先「开始整理」。")
             return
         try:
-            os.startfile(d)
+            open_in_system(d)
         except Exception as e:
             self.log("[WARN] 无法打开输出文件夹: " + str(e))
 
