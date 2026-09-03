@@ -8,7 +8,7 @@
 设计原则：
 - 零运行时依赖：仅用 Python 标准库（tkinter 自带）。
 - 安全优先：默认只扫描、生成预览报告，绝不改动任何源文件；点「一键归类」才复制。
-- 源文件永不被删除或移动，只复制到输出目录。
+- 「清理原始文件」为可选显式操作：仅删除已成功复制过的原始文件，且一律移入回收站（可恢复），绝不永久删除无副本的源文件。
 - 中文路径/文件名友好。
 - v1.3.0：分类勾选过滤、文件列表与双击预览、删除已归类副本（仅输出目录）。
 """
@@ -118,6 +118,62 @@ def sha256_of(p, chunk=1 << 20):
     except OSError:
         return "ERR"
     return h.hexdigest()
+
+
+def send_to_recycle_bin(paths):
+    """把文件/目录移入 Windows 回收站（可恢复）。
+
+    返回 (ok, failures)，failures 为 (path, reason) 列表。
+    若无法调用 Shell，则回退为永久删除并给出警告。
+    注意：默认不弹系统确认框（FOF_NOCONFIRMATION），由调用方负责二次确认。
+    """
+    import ctypes
+    from ctypes import wintypes
+    try:
+        shell32 = ctypes.windll.shell32
+    except Exception:
+        failures = []
+        for p in paths:
+            try:
+                if os.path.isdir(p):
+                    shutil.rmtree(p)
+                else:
+                    os.remove(p)
+            except OSError as e:
+                failures.append((p, "永久删除失败: " + str(e)))
+        return len(paths) - len(failures), failures
+
+    class SHFILEOPSTRUCT(ctypes.Structure):
+        _fields_ = [
+            ("hwnd", wintypes.HWND),
+            ("wFunc", wintypes.UINT),
+            ("pFrom", wintypes.LPCWSTR),
+            ("pTo", wintypes.LPCWSTR),
+            ("fFlags", wintypes.UINT),
+            ("fAnyOperationsAborted", wintypes.BOOL),
+            ("hNameMappings", ctypes.c_void_p),
+            ("lpszProgressTitle", wintypes.LPCWSTR),
+        ]
+
+    FO_DELETE = 3
+    FOF_ALLOWUNDO = 0x40          # 移入回收站（可恢复）
+    FOF_NOCONFIRMATION = 0x10     # 不弹系统确认框
+    FOF_NOERRORUI = 0x0400
+    FOF_SILENT = 0x0004
+
+    from_str = "\0".join(paths) + "\0\0"
+    op = SHFILEOPSTRUCT()
+    op.hwnd = None
+    op.wFunc = FO_DELETE
+    op.pFrom = from_str
+    op.pTo = None
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT
+    rc = shell32.SHFileOperationW(ctypes.byref(op))
+    if rc == 0 and not op.fAnyOperationsAborted:
+        return len(paths), []
+    # 部分失败：统计仍未删除的
+    failures = [(p, "仍存在于磁盘 (rc=%r)" % rc) for p in paths if os.path.exists(p)]
+    return len(paths) - len(failures), failures
 
 
 # ---------- 路径发现 ----------
@@ -318,7 +374,7 @@ class OrganizerApp:
                 command=self._refresh_will).pack(side="left", padx=(8, 6), pady=6)
 
         # 输出目录
-        f_dst = ttk.LabelFrame(self.master, text="输出目录（源文件不会被删除，只复制到此处）")
+        f_dst = ttk.LabelFrame(self.master, text="输出目录（归类副本存放处；原始文件可在确认后移入回收站）")
         f_dst.pack(fill="x", **pad)
         ttk.Entry(f_dst, textvariable=self.dest_dir, width=78).pack(
             side="left", fill="x", expand=True, padx=(8, 4), pady=8)
@@ -336,6 +392,9 @@ class OrganizerApp:
         self.clear_btn = ttk.Button(f_act, text="清空归类文件夹",
                                     command=self.clear_output)
         self.clear_btn.pack(side="left", padx=(0, 10))
+        self.del_orig_btn = ttk.Button(f_act, text="清理原始文件（回收站）",
+                                       command=self.delete_originals, state="disabled")
+        self.del_orig_btn.pack(side="left", padx=(0, 10))
         self.progress = ttk.Progressbar(f_act, mode="indeterminate", length=160)
         self.progress.pack(side="left", padx=(12, 0))
 
@@ -362,7 +421,7 @@ class OrganizerApp:
         self.tree.pack(fill="x", padx=10, pady=6)
 
         # 文件列表
-        f_files = ttk.LabelFrame(self.master, text="文件列表（双击预览/打开，右键可删除已归类副本）")
+        f_files = ttk.LabelFrame(self.master, text="文件列表（双击预览/打开，右键可删除归类副本或原始文件）")
         f_files.pack(fill="both", expand=True, **pad)
         fcols = ("name", "cat", "size", "mtime", "will")
         self.tree_files = ttk.Treeview(f_files, columns=fcols, show="headings", height=9)
@@ -389,6 +448,9 @@ class OrganizerApp:
         self.file_menu.add_command(label="打开所在文件夹", command=self._menu_open_folder)
         self.file_menu.add_separator()
         self.file_menu.add_command(label="删除此文件的归类副本", command=self._menu_delete_one)
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="删除此文件的原始文件（回收站）",
+                                   command=self._menu_delete_original_one)
 
         # 日志
         f_log = ttk.LabelFrame(self.master, text="日志")
@@ -613,6 +675,7 @@ class OrganizerApp:
         self.progress.stop()
         self.scan_btn.configure(state="normal")
         self.apply_btn.configure(state="normal")
+        self.del_orig_btn.configure(state="normal")
         self.status.set("归类完成")
         self.log("[OK] 已归类完成，复制 %d 个文件到: %s" % (copied, dest))
         if skipped_dup:
@@ -755,6 +818,108 @@ class OrganizerApp:
         self.log("[DEL] 已清空归类文件夹，删除 %d 个文件: %s" % (removed, dest))
         self.status.set("已清空归类文件夹（%d 个文件）" % removed)
         messagebox.showinfo("完成", "已删除 %d 个归类副本文件。" % removed)
+
+    # ---------- 删除原始（源）文件：仅清理已成功复制过的，移入回收站 ----------
+    def _verified_original_pairs(self):
+        """返回 [(src, dst), ...]，其中 src 仍存在且 dst 已成功复制（可安全清理）。"""
+        pairs = []
+        for src, dst in self.copy_map.items():
+            if os.path.exists(src) and os.path.exists(dst):
+                pairs.append((src, dst))
+        return pairs
+
+    def _menu_delete_original_one(self):
+        sel = self.tree_files.selection()
+        if not sel:
+            return
+        rec = self._rec_from_iid(sel[0])
+        if not rec:
+            return
+        src = rec["path"]
+        dst = self.copy_map.get(src)
+        if not dst or not os.path.exists(dst):
+            messagebox.showinfo(
+                "提示",
+                "该文件的归类副本不存在，无法确认安全删除原始文件。\n请先「一键归类」成功后再清理原始文件。")
+            return
+        if not os.path.exists(src):
+            messagebox.showinfo("提示", "原始文件已不存在：\n" + src)
+            return
+        ans = messagebox.askyesno(
+            "删除原始文件（回收站）",
+            "将把微信【原始文件】移入回收站（可在回收站恢复），输出目录中的副本会保留：\n%s\n\n大小：%s\n\n是否继续？"
+            % (src, human(os.path.getsize(src))))
+        if not ans:
+            return
+        ok, failures = send_to_recycle_bin([src])
+        if ok:
+            self.log("[DEL-ORIG] 已移入回收站: " + src)
+            self.status.set("已清理 1 个原始文件（回收站）")
+        else:
+            for p, r in failures:
+                self.log("[WARN] 删除原始文件失败: " + p + " (" + r + ")")
+
+    def delete_originals(self):
+        if not self.has_organized:
+            messagebox.showinfo("提示", "请先「一键归类」成功后再清理原始文件。")
+            return
+        pairs = self._verified_original_pairs()
+        if not pairs:
+            messagebox.showinfo(
+                "提示",
+                "没有可清理的原始文件（需先归类成功、且原始与副本都存在）。")
+            return
+        total = sum(os.path.getsize(s) for s, _ in pairs)
+        ans = messagebox.askyesno(
+            "清理原始文件（回收站）",
+            "即将把 %d 个微信【原始文件】移入回收站（可在回收站里恢复），\n"
+            "输出目录中的副本会完整保留。\n\n"
+            "仅清理已成功复制到输出目录的原始文件，避免误删。\n"
+            "文件总大小：%s\n\n是否继续？"
+            % (len(pairs), human(total)))
+        if not ans:
+            return
+        self.scan_btn.configure(state="disabled")
+        self.apply_btn.configure(state="disabled")
+        self.del_orig_btn.configure(state="disabled")
+        self.progress.start()
+        self.status.set("正在清理原始文件（回收站）...")
+        self.log("开始清理原始文件（移入回收站），共 %d 个，%s" % (len(pairs), human(total)))
+        threading.Thread(target=self._do_delete_originals, args=(pairs,),
+                         daemon=True).start()
+
+    def _do_delete_originals(self, pairs):
+        ok_total = 0
+        failures = []
+        for src, _ in pairs:
+            ok, fails = send_to_recycle_bin([src])
+            ok_total += ok
+            failures.extend(fails)
+        # 清理 copy_map 中已被移入回收站的原始项
+        done_srcs = {s for s, _ in pairs if not os.path.exists(s)}
+        self.copy_map = {k: v for k, v in self.copy_map.items() if k not in done_srcs}
+        self.master.after(0, self._on_delete_originals_done,
+                          ok_total, len(pairs), failures)
+
+    def _on_delete_originals_done(self, ok, total, failures):
+        self.progress.stop()
+        self.scan_btn.configure(state="normal")
+        self.apply_btn.configure(state="normal")
+        self.status.set("原始文件清理完成")
+        self.log("[OK] 已将 %d / %d 个原始文件移入回收站" % (ok, total))
+        for p, r in failures:
+            self.log("[WARN] 删除原始文件失败: " + p + " (" + r + ")")
+        if failures:
+            messagebox.showwarning(
+                "部分完成",
+                "已将 %d / %d 个原始文件移入回收站，%d 个失败（详见日志）。"
+                % (ok, total, len(failures)))
+        else:
+            messagebox.showinfo(
+                "完成",
+                "已将 %d 个微信原始文件移入回收站（可在回收站恢复），\n输出目录的副本已保留。"
+                % ok)
+
 
 
 def main():
