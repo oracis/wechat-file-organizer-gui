@@ -10,11 +10,11 @@
 - 安全优先：默认只扫描、生成预览报告，绝不改动任何源文件；点「一键归类」才复制。
 - 源文件永不被删除或移动，只复制到输出目录。
 - 中文路径/文件名友好。
+- v1.3.0：分类勾选过滤、文件列表与双击预览、删除已归类副本（仅输出目录）。
 """
 import os
 import re
 import sys
-import hashlib
 import shutil
 import threading
 import unicodedata
@@ -22,7 +22,7 @@ from datetime import datetime
 
 try:
     import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox, scrolledtext
+    from tkinter import ttk, filedialog, messagebox, scrolledtext, Menu
 except ImportError:
     sys.exit("本程序需要 Tkinter 图形库（Python 标准库自带，正常情况下已包含）。")
 
@@ -42,6 +42,9 @@ EXT_TO_CAT = {}
 for _cat, _exts in CATEGORIES.items():
     for _e in _exts:
         EXT_TO_CAT[_e] = _cat
+
+# Tk 的 PhotoImage 能直接显示的常见图片格式（jpg 需 PIL，故回退到系统打开）
+IMAGE_PREVIEW_EXTS = {".png", ".gif", ".bmp", ".tiff", ".tif"}
 
 MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
 
@@ -99,6 +102,7 @@ def month_of(path):
 
 
 def sha256_of(p, chunk=1 << 20):
+    import hashlib
     h = hashlib.sha256()
     try:
         with open(p, "rb") as f:
@@ -251,16 +255,23 @@ class OrganizerApp:
     def __init__(self, master):
         self.master = master
         master.title("微信文件自动归类")
-        master.geometry("780x720")
-        master.minsize(680, 560)
+        master.geometry("880x820")
+        master.minsize(720, 640)
 
         self.records = []
+        self.file_list = []          # 与文件列表树行一一对应的记录
+        self.copy_map = {}           # 归类后 src -> dst 映射
+        self.has_organized = False
+
         self.source_dir = tk.StringVar()
         self.dest_dir = tk.StringVar()
         self.scheme = tk.StringVar(value="type")
         self.dedupe = tk.BooleanVar(value=False)
         self.deep_scan = tk.BooleanVar(value=False)
         self.scanning = False
+
+        # 分类勾选（默认全勾）
+        self.cat_enabled = {c: tk.BooleanVar(value=True) for c in CATEGORIES}
 
         detected = find_wechat_files_dir() or ""
         self.source_dir.set(detected)
@@ -274,7 +285,7 @@ class OrganizerApp:
         # 源目录
         f_src = ttk.LabelFrame(self.master, text="微信文件目录")
         f_src.pack(fill="x", **pad)
-        ttk.Entry(f_src, textvariable=self.source_dir, width=70).pack(
+        ttk.Entry(f_src, textvariable=self.source_dir, width=78).pack(
             side="left", fill="x", expand=True, padx=(8, 4), pady=8)
         ttk.Button(f_src, text="浏览...", command=self.browse_source).pack(
             side="left", padx=(0, 8), pady=8)
@@ -283,20 +294,28 @@ class OrganizerApp:
         f_set = ttk.LabelFrame(self.master, text="归类设置")
         f_set.pack(fill="x", **pad)
         ttk.Label(f_set, text="归类方式:").pack(side="left", padx=(8, 4), pady=8)
-        cb = ttk.Combobox(f_set, textvariable=self.scheme, width=22, state="readonly")
+        cb = ttk.Combobox(f_set, textvariable=self.scheme, width=20, state="readonly")
         cb["values"] = ("type", "month", "type-month")
         cb.pack(side="left", padx=(0, 12), pady=8)
-        ttk.Label(f_set, text="（type=按类型 / month=按月份 / type-month=类型+月份）").pack(
+        ttk.Label(f_set, text="（按类型 / 按月份 / 类型+月份）").pack(
             side="left", padx=(0, 8), pady=8)
         ttk.Checkbutton(f_set, text="去重（相同内容只保留一份）", variable=self.dedupe).pack(
             side="left", padx=(4, 8), pady=8)
-        ttk.Checkbutton(f_set, text="兼容模式（递归扫描任意目录，忽略微信系统文件）",
+        ttk.Checkbutton(f_set, text="兼容模式（递归扫描任意目录）",
                         variable=self.deep_scan).pack(side="left", padx=(4, 8), pady=8)
+
+        # 归类类别勾选
+        f_cat = ttk.LabelFrame(self.master, text="归类类别（取消勾选则不整理该类）")
+        f_cat.pack(fill="x", **pad)
+        for c in CATEGORIES:
+            ttk.Checkbutton(
+                f_cat, text=c, variable=self.cat_enabled[c],
+                command=self._refresh_will).pack(side="left", padx=(8, 6), pady=6)
 
         # 输出目录
         f_dst = ttk.LabelFrame(self.master, text="输出目录（源文件不会被删除，只复制到此处）")
         f_dst.pack(fill="x", **pad)
-        ttk.Entry(f_dst, textvariable=self.dest_dir, width=70).pack(
+        ttk.Entry(f_dst, textvariable=self.dest_dir, width=78).pack(
             side="left", fill="x", expand=True, padx=(8, 4), pady=8)
         ttk.Button(f_dst, text="浏览...", command=self.browse_dest).pack(
             side="left", padx=(0, 8), pady=8)
@@ -306,10 +325,13 @@ class OrganizerApp:
         f_act.pack(fill="x", **pad)
         self.scan_btn = ttk.Button(f_act, text="扫描（只读预览）", command=self.scan)
         self.scan_btn.pack(side="left", padx=(0, 10))
-        self.apply_btn = ttk.Button(f_act, text="一键归类（复制文件）",
+        self.apply_btn = ttk.Button(f_act, text="一键归类（复制勾选类别）",
                                     command=self.apply_organize, state="disabled")
-        self.apply_btn.pack(side="left")
-        self.progress = ttk.Progressbar(f_act, mode="indeterminate", length=180)
+        self.apply_btn.pack(side="left", padx=(0, 10))
+        self.clear_btn = ttk.Button(f_act, text="清空归类文件夹",
+                                    command=self.clear_output)
+        self.clear_btn.pack(side="left", padx=(0, 10))
+        self.progress = ttk.Progressbar(f_act, mode="indeterminate", length=160)
         self.progress.pack(side="left", padx=(12, 0))
 
         # 统计
@@ -319,23 +341,54 @@ class OrganizerApp:
         ttk.Label(f_stat, textvariable=self.stat_var, justify="left").pack(
             anchor="w", padx=10, pady=6)
 
-        # 类别表格
-        f_tree = ttk.LabelFrame(self.master, text="按类型统计")
-        f_tree.pack(fill="both", expand=True, **pad)
-        cols = ("cat", "count", "size")
-        self.tree = ttk.Treeview(f_tree, columns=cols, show="headings", height=6)
+        # 类别汇总
+        f_tree = ttk.LabelFrame(self.master, text="按类型统计（将归类的类别）")
+        f_tree.pack(fill="x", **pad)
+        cols = ("cat", "count", "size", "will")
+        self.tree = ttk.Treeview(f_tree, columns=cols, show="headings", height=5)
         self.tree.heading("cat", text="类别")
         self.tree.heading("count", text="文件数")
         self.tree.heading("size", text="大小")
+        self.tree.heading("will", text="将归类")
         self.tree.column("cat", width=120)
-        self.tree.column("count", width=100)
-        self.tree.column("size", width=140)
-        self.tree.pack(fill="both", expand=True, padx=10, pady=6)
+        self.tree.column("count", width=90)
+        self.tree.column("size", width=130)
+        self.tree.column("will", width=80)
+        self.tree.pack(fill="x", padx=10, pady=6)
+
+        # 文件列表
+        f_files = ttk.LabelFrame(self.master, text="文件列表（双击预览/打开，右键可删除已归类副本）")
+        f_files.pack(fill="both", expand=True, **pad)
+        fcols = ("name", "cat", "size", "mtime", "will")
+        self.tree_files = ttk.Treeview(f_files, columns=fcols, show="headings", height=9)
+        self.tree_files.heading("name", text="文件名")
+        self.tree_files.heading("cat", text="类别")
+        self.tree_files.heading("size", text="大小")
+        self.tree_files.heading("mtime", text="修改时间")
+        self.tree_files.heading("will", text="将归类")
+        self.tree_files.column("name", width=320)
+        self.tree_files.column("cat", width=80)
+        self.tree_files.column("size", width=100)
+        self.tree_files.column("mtime", width=120)
+        self.tree_files.column("will", width=70)
+        vsb = ttk.Scrollbar(f_files, orient="vertical", command=self.tree_files.yview)
+        self.tree_files.configure(yscrollcommand=vsb.set)
+        self.tree_files.pack(side="left", fill="both", expand=True, padx=(10, 0), pady=6)
+        vsb.pack(side="right", fill="y", pady=6, padx=(0, 10))
+        self.tree_files.bind("<Double-1>", self._on_file_double)
+        self.tree_files.bind("<Button-3>", self._on_file_right)
+
+        # 右键菜单
+        self.file_menu = Menu(self.master, tearoff=0)
+        self.file_menu.add_command(label="打开 / 预览", command=self._menu_open)
+        self.file_menu.add_command(label="打开所在文件夹", command=self._menu_open_folder)
+        self.file_menu.add_separator()
+        self.file_menu.add_command(label="删除此文件的归类副本", command=self._menu_delete_one)
 
         # 日志
         f_log = ttk.LabelFrame(self.master, text="日志")
         f_log.pack(fill="both", expand=True, **pad)
-        self.logbox = scrolledtext.ScrolledText(f_log, height=8, state="disabled",
+        self.logbox = scrolledtext.ScrolledText(f_log, height=7, state="disabled",
                                                 wrap="word")
         self.logbox.pack(fill="both", expand=True, padx=10, pady=6)
 
@@ -350,21 +403,23 @@ class OrganizerApp:
         self.logbox.see("end")
         self.logbox.configure(state="disabled")
 
+    # ---------- 浏览 ----------
     def browse_source(self):
         d = filedialog.askdirectory(title="选择微信文件目录")
         if d:
             self.source_dir.set(d)
-            cur = self.dest_dir.get().strip()
-            if not cur or cur == default_output_dir():
-                self.dest_dir.set(default_output_dir())
             self.apply_btn.configure(state="disabled")
             self.tree.delete(*self.tree.get_children())
+            self.tree_files.delete(*self.tree_files.get_children())
+            self.file_list = []
+            self.has_organized = False
 
     def browse_dest(self):
         d = filedialog.askdirectory(title="选择归类输出目录")
         if d:
             self.dest_dir.set(d)
 
+    # ---------- 扫描 ----------
     def scan(self):
         if self.scanning:
             return
@@ -411,7 +466,7 @@ class OrganizerApp:
         self.progress.stop()
         self.scan_btn.configure(state="normal")
         self.status.set("未发现可归类的文件")
-        self.stat_var.set("未发现可归类的文件（目录下可能没有 FileStorage/File）")
+        self.stat_var.set("未发现可归类的文件（目录下可能没有可整理的文件）")
         self.log("[SKIP] 未发现可归类的文件。")
         self.log("提示：已尝试兼容模式（递归扫描）仍无结果。")
         self.log("      请确认所选目录下确实包含微信接收的文档/图片/视频等文件。")
@@ -438,20 +493,22 @@ class OrganizerApp:
         dup_recover = sum(max(x["size"] for x in rs) * (len(rs) - 1)
                           for rs in dupes.values())
 
+        # 类别汇总（反映勾选）
         self.tree.delete(*self.tree.get_children())
         for cat in CATEGORIES:
             if cat in by_cat:
                 c = by_cat[cat]
-                self.tree.insert("", "end", values=(cat, c[0], human(c[1])))
-        if "其他" not in by_cat and any(k not in CATEGORIES for k in by_cat):
-            for cat in by_cat:
-                if cat not in CATEGORIES:
-                    c = by_cat[cat]
-                    self.tree.insert("", "end", values=(cat, c[0], human(c[1])))
+                will = "是" if self.cat_enabled[cat].get() else "否"
+                self.tree.insert("", "end", values=(cat, c[0], human(c[1]), will))
+
+        # 文件列表
+        self._populate_file_list(records)
 
         self.stat_var.set(
-            "文件总数 %d | 总大小 %s | 重复文件 %d 个（去重可省 %s）"
-            % (total, human(total_size), dup_count, human(dup_recover)))
+            "文件总数 %d | 总大小 %s | 将归类 %d 个 | 重复 %d 个（去重可省 %s）"
+            % (total, human(total_size),
+               sum(1 for r in records if self.cat_enabled[r["cat"]].get()),
+               dup_count, human(dup_recover)))
 
         self.log("扫描完成: 共 %d 个文件，总大小 %s" % (total, human(total_size)))
         self.log("按类型: " + "，".join(
@@ -460,9 +517,40 @@ class OrganizerApp:
         if dup_count:
             self.log("发现重复文件 %d 个，去重可节省 %s（勾选「去重」后归类会跳过重复项）"
                      % (dup_count, human(dup_recover)))
-        self.log("预览就绪。点击「一键归类」将文件复制到输出目录（源文件不动）。")
+        self.log("预览就绪。点击「一键归类」将勾选类别复制到输出目录（源文件不动）。")
         self.status.set("扫描完成，可归类")
 
+    def _populate_file_list(self, records):
+        self.tree_files.delete(*self.tree_files.get_children())
+        self.file_list = list(records)
+        for i, r in enumerate(records):
+            will = "是" if self.cat_enabled[r["cat"]].get() else "否"
+            try:
+                mt = datetime.fromtimestamp(r["mtime"]).strftime("%Y-%m-%d %H:%M")
+            except OSError:
+                mt = "未知"
+            self.tree_files.insert(
+                "", "end", iid=str(i),
+                values=(os.path.basename(r["path"]), r["cat"],
+                        human(r["size"]), mt, will))
+
+    def _refresh_will(self):
+        # 勾选变化时，刷新两类表格的「将归类」列
+        for cat in CATEGORIES:
+            if cat in self.cat_enabled:
+                will = "是" if self.cat_enabled[cat].get() else "否"
+                for row in self.tree.get_children():
+                    if self.tree.item(row, "values")[0] == cat:
+                        v = self.tree.item(row, "values")
+                        self.tree.item(row, values=(cat, v[1], v[2], will))
+        for iid in self.tree_files.get_children():
+            i = int(iid)
+            rec = self.file_list[i]
+            will = "是" if self.cat_enabled[rec["cat"]].get() else "否"
+            v = self.tree_files.item(iid, "values")
+            self.tree_files.item(iid, values=(v[0], v[1], v[2], v[3], will))
+
+    # ---------- 归类 ----------
     def apply_organize(self):
         if not self.records:
             return
@@ -470,10 +558,14 @@ class OrganizerApp:
         if not dest:
             messagebox.showerror("错误", "请先选择输出目录。")
             return
-        n = len(self.records)
+        enabled = [r for r in self.records if self.cat_enabled[r["cat"]].get()]
+        if not enabled:
+            messagebox.showwarning("提示", "没有勾选任何类别，无法归类。")
+            return
+        n = len(enabled)
         ans = messagebox.askyesno(
             "确认归类",
-            "即将把 %d 个文件复制到:\n%s\n\n源文件不会被删除或移动（仅复制）。\n是否继续？"
+            "即将把 %d 个文件（已勾选类别）复制到:\n%s\n\n源文件不会被删除或移动（仅复制）。\n是否继续？"
             % (n, dest))
         if not ans:
             return
@@ -490,8 +582,12 @@ class OrganizerApp:
         os.makedirs(dest, exist_ok=True)
         used = set()
         seen_hash = set()
-        copied = skipped_dup = 0
+        copied = skipped_dup = skipped_cat = 0
+        self.copy_map = {}
         for r in self.records:
+            if not self.cat_enabled[r["cat"]].get():
+                skipped_cat += 1
+                continue
             if dedupe and r["hash"] in seen_hash:
                 skipped_dup += 1
                 continue
@@ -501,20 +597,159 @@ class OrganizerApp:
             try:
                 os.makedirs(os.path.dirname(dp), exist_ok=True)
                 shutil.copy2(r["path"], dp)
+                self.copy_map[r["path"]] = dp
                 copied += 1
             except OSError as e:
                 self.master.after(0, lambda m=str(e): self.log("[WARN] 复制失败: " + m))
-        self.master.after(0, self._on_apply_done, dest, copied, skipped_dup)
+        self.has_organized = True
+        self.master.after(0, self._on_apply_done, dest, copied, skipped_dup, skipped_cat)
 
-    def _on_apply_done(self, dest, copied, skipped_dup):
+    def _on_apply_done(self, dest, copied, skipped_dup, skipped_cat):
         self.progress.stop()
         self.scan_btn.configure(state="normal")
+        self.apply_btn.configure(state="normal")
         self.status.set("归类完成")
         self.log("[OK] 已归类完成，复制 %d 个文件到: %s" % (copied, dest))
         if skipped_dup:
             self.log("      去重跳过 %d 个重复文件" % skipped_dup)
-        self.log("源文件未做任何改动。")
+        if skipped_cat:
+            self.log("      因未勾选类别跳过 %d 个文件" % skipped_cat)
+        self.log("源文件未做任何改动。如需清理，可在文件列表右键「删除此文件的归类副本」或点「清空归类文件夹」。")
         messagebox.showinfo("完成", "已复制 %d 个文件到:\n%s" % (copied, dest))
+
+    # ---------- 预览 / 打开 ----------
+    def _rec_from_iid(self, iid):
+        try:
+            i = int(iid)
+            return self.file_list[i]
+        except (ValueError, IndexError):
+            return None
+
+    def _on_file_double(self, event):
+        sel = self.tree_files.selection()
+        if not sel:
+            return
+        rec = self._rec_from_iid(sel[0])
+        if rec:
+            self._preview_file(rec["path"])
+
+    def _preview_file(self, path):
+        if not os.path.exists(path):
+            messagebox.showerror("错误", "文件不存在：\n" + path)
+            return
+        ext = os.path.splitext(path)[1].lower()
+        if ext in IMAGE_PREVIEW_EXTS:
+            self._show_image_preview(path)
+        else:
+            # 其他类型用系统默认程序打开（查看）
+            try:
+                os.startfile(path)
+            except Exception as e:
+                self.log("[WARN] 无法打开预览: " + str(e))
+
+    def _show_image_preview(self, path):
+        win = tk.Toplevel(self.master)
+        win.title("预览: " + os.path.basename(path))
+        try:
+            img = tk.PhotoImage(file=path)
+            # 限制最大显示尺寸
+            max_w, max_h = 760, 560
+            w, h = img.width(), img.height()
+            if w > max_w or h > max_h:
+                ratio = min(max_w / w, max_h / h)
+                img = img.subsample(max(1, int(1 / ratio)))
+            lbl = ttk.Label(win, image=img)
+            lbl.image = img
+            lbl.pack(padx=10, pady=10)
+            win.geometry("%dx%d" % (min(w, max_w) + 20, min(h, max_h) + 20))
+        except Exception as e:
+            win.destroy()
+            try:
+                os.startfile(path)
+            except Exception:
+                self.log("[WARN] 图片预览失败，改用系统打开: " + str(e))
+
+    def _on_file_right(self, event):
+        iid = self.tree_files.identify_row(event.y)
+        if iid:
+            self.tree_files.selection_set(iid)
+            self.file_menu.post(event.x_root, event.y_root)
+
+    def _menu_open(self):
+        sel = self.tree_files.selection()
+        if not sel:
+            return
+        rec = self._rec_from_iid(sel[0])
+        if rec:
+            self._preview_file(rec["path"])
+
+    def _menu_open_folder(self):
+        sel = self.tree_files.selection()
+        if not sel:
+            return
+        rec = self._rec_from_iid(sel[0])
+        if not rec:
+            return
+        d = os.path.dirname(rec["path"])
+        try:
+            os.startfile(d)
+        except Exception as e:
+            self.log("[WARN] 无法打开文件夹: " + str(e))
+
+    # ---------- 删除已归类副本（仅输出目录） ----------
+    def _menu_delete_one(self):
+        sel = self.tree_files.selection()
+        if not sel:
+            messagebox.showinfo("提示", "请先扫描并归类后再删除副本。")
+            return
+        rec = self._rec_from_iid(sel[0])
+        if not rec:
+            return
+        dst = self.copy_map.get(rec["path"])
+        if not dst or not os.path.exists(dst):
+            messagebox.showinfo("提示", "该文件尚未归类，没有可删除的副本。")
+            return
+        ans = messagebox.askyesno(
+            "删除归类副本",
+            "将删除输出目录中的副本（不影响微信源文件）:\n%s\n\n是否继续？" % dst)
+        if not ans:
+            return
+        try:
+            os.remove(dst)
+            self.log("[DEL] 已删除归类副本: " + dst)
+            self.status.set("已删除一个归类副本")
+        except OSError as e:
+            self.log("[WARN] 删除失败: " + str(e))
+
+    def clear_output(self):
+        dest = self.dest_dir.get().strip()
+        if not dest or not os.path.isdir(dest):
+            messagebox.showinfo("提示", "输出文件夹不存在或尚未归类。")
+            return
+        files = []
+        for dp, _, fnames in os.walk(dest):
+            for fn in fnames:
+                files.append(os.path.join(dp, fn))
+        if not files:
+            messagebox.showinfo("提示", "输出文件夹为空，无需清理。")
+            return
+        ans = messagebox.askyesno(
+            "确认清空归类文件夹",
+            "将删除以下文件夹内的全部 %d 个文件（仅输出目录，不影响微信源文件）:\n%s\n\n此操作不可恢复！是否继续？"
+            % (len(files), dest))
+        if not ans:
+            return
+        removed = 0
+        for f in files:
+            try:
+                os.remove(f)
+                removed += 1
+            except OSError as e:
+                self.log("[WARN] 删除失败: " + str(e))
+        self.copy_map = {k: v for k, v in self.copy_map.items() if os.path.exists(v)}
+        self.log("[DEL] 已清空归类文件夹，删除 %d 个文件: %s" % (removed, dest))
+        self.status.set("已清空归类文件夹（%d 个文件）" % removed)
+        messagebox.showinfo("完成", "已删除 %d 个归类副本文件。" % removed)
 
 
 def main():
