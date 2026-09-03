@@ -11,10 +11,12 @@
 - 「清理原始文件」为可选显式操作：选定后移入回收站（可恢复），默认不永久删除；批量清理时会提示哪些文件已有归类副本、哪些尚未归类，由用户确认后再执行。
 - 中文路径/文件名友好。
 - v1.5.0：文件列表拆分为「原始文件」与「归类副本」两个标签页，删除后自动刷新。
+- v1.6.0：新增「按修改时间筛选」（最近7/30/90天、今年、自定义日期区间）与「输出目录结构自定义」（按类型/月份/年份/组合 + 自定义路径模板如 {type}/{yyyy}/{mm}）。
 """
 import os
 import re
 import sys
+import time
 import shutil
 import threading
 import unicodedata
@@ -47,8 +49,18 @@ for _cat, _exts in CATEGORIES.items():
 SCHEME_LABELS = {
     "按类型": "type",
     "按月份": "month",
+    "按年份": "year",
     "按类型+月份": "type-month",
+    "按类型+年份": "type-year",
+    "按年份+月份": "year-month",
+    "自定义模板": "custom",
 }
+
+# 扫描筛选：时间范围
+TIME_RANGES = ["全部", "最近7天", "最近30天", "最近90天", "今年", "自定义"]
+
+# 自定义路径模板令牌（如 {type}/{yyyy}/{mm}）
+TEMPLATE_TOKEN_RE = re.compile(r"\{([^}]+)\}")
 
 # Tk 的 PhotoImage 能直接显示的常见图片格式（jpg 需 PIL，故回退到系统打开）
 IMAGE_PREVIEW_EXTS = {".png", ".gif", ".bmp", ".tiff", ".tif"}
@@ -296,18 +308,71 @@ def collect_sources(root, include_media=False, scan_all=False, recursive=False):
     return files
 
 
-def dest_path(dest_root, scheme, cat, month, fname, used):
-    if scheme == "month":
-        rel = os.path.join(month, fname)
-    elif scheme == "type-month":
-        rel = os.path.join(cat, month, fname)
-    else:  # type
-        rel = os.path.join(cat, fname)
-    base, ext = os.path.splitext(fname)
+def build_from_template(tmpl, cat, month, mtime, fname):
+    """按自定义模板生成相对目录结构。
+
+    支持令牌：{type}/{cat} 类别、{month} YYYY-MM、{year} YYYY、
+    {yyyy} 年份4位、{yy} 年份2位、{mm} 月份、{dd} 日、{ext} 扩展名(无点)。
+    其余字符原样保留。非法/危险片段会被清洗。
+    """
+    year = month.split("-")[0] if "-" in month else "未知"
+    mm = month.split("-")[1] if "-" in month else ""
+    try:
+        dt = datetime.fromtimestamp(mtime)
+        yyyy = dt.strftime("%Y"); yy = dt.strftime("%y")
+        d_mm = dt.strftime("%m"); d_dd = dt.strftime("%d")
+    except OSError:
+        yyyy = year; yy = year[-2:] if len(year) >= 2 else year
+        d_mm = mm; d_dd = ""
+    _, ext = os.path.splitext(fname)
+    table = {
+        "type": cat, "cat": cat, "month": month, "year": year,
+        "yyyy": yyyy, "yy": yy, "mm": d_mm, "dd": d_dd,
+        "ext": ext.lstrip("."),
+    }
+    parsed = TEMPLATE_TOKEN_RE.sub(lambda m: table.get(m.group(1).lower(), m.group(0)), tmpl)
+    # 清洗：去掉驱动盘符、前导分隔符、.. 等危险片段
+    parts = []
+    for seg in re.split(r"[/\\]", parsed):
+        seg = seg.strip()
+        if not seg or seg in (".", ".."):
+            continue
+        seg = re.sub(r"^[A-Za-z]:", "", seg)
+        parts.append(seg)
+    if not parts:
+        parts = [fname]
+    return os.path.join(*parts)
+
+
+def preset_rel(key, cat, month, fname):
+    year = month.split("-")[0] if "-" in month else "未知"
+    if key == "type":
+        parts = [cat]
+    elif key == "month":
+        parts = [month]
+    elif key == "year":
+        parts = [year]
+    elif key == "type-month":
+        parts = [cat, month]
+    elif key == "type-year":
+        parts = [cat, year]
+    elif key == "year-month":
+        parts = [year, month]
+    else:
+        parts = [cat]
+    return os.path.join(*parts, fname)
+
+
+def dest_path(dest_root, rel, used):
+    """根据相对路径 rel（含文件名）计算去重后的目标路径。"""
+    if not rel:
+        rel = os.path.basename(rel) or "file"
+    base, ext = os.path.splitext(os.path.basename(rel))
     cand = rel
     i = 1
     while os.path.join(dest_root, cand) in used or os.path.exists(os.path.join(dest_root, cand)):
-        cand = os.path.join(os.path.dirname(rel), "%s_%d%s" % (base, i, ext))
+        d = os.path.dirname(rel)
+        cand = os.path.join(d, "%s_%d%s" % (base, i, ext))
         i += 1
     used.add(os.path.join(dest_root, cand))
     return os.path.join(dest_root, cand)
@@ -318,8 +383,8 @@ class OrganizerApp:
     def __init__(self, master):
         self.master = master
         master.title("微信文件自动归类")
-        master.geometry("940x860")
-        master.minsize(760, 680)
+        master.geometry("1000x960")
+        master.minsize(800, 720)
 
         self.records = []
         self.file_list = []          # 原始文件记录（与 tree_files 行一一对应）
@@ -332,6 +397,10 @@ class OrganizerApp:
         self.scheme = tk.StringVar(value="按类型")
         self.dedupe = tk.BooleanVar(value=False)
         self.deep_scan = tk.BooleanVar(value=False)
+        self.time_range = tk.StringVar(value="全部")
+        self.tmpl = tk.StringVar(value="{type}/{yyyy}/{mm}")
+        self.date_from = tk.StringVar()
+        self.date_to = tk.StringVar()
         self.scanning = False
 
         # 分类勾选（默认全勾）
@@ -360,11 +429,51 @@ class OrganizerApp:
         ttk.Label(f_set, text="归类方式:").pack(side="left", padx=(8, 4), pady=8)
         cb = ttk.Combobox(f_set, textvariable=self.scheme, width=20, state="readonly")
         cb["values"] = tuple(SCHEME_LABELS.keys())
+        cb.bind("<<ComboboxSelected>>", self._on_scheme_change)
         cb.pack(side="left", padx=(0, 12), pady=8)
         ttk.Checkbutton(f_set, text="去重（相同内容只保留一份）", variable=self.dedupe).pack(
             side="left", padx=(4, 8), pady=8)
         ttk.Checkbutton(f_set, text="兼容模式（递归扫描任意目录）",
                         variable=self.deep_scan).pack(side="left", padx=(4, 8), pady=8)
+
+        # 输出目录结构（自定义模板）
+        f_struct = ttk.LabelFrame(
+            self.master,
+            text="输出目录结构（选「自定义模板」可在下方输入路径模板）")
+        f_struct.pack(fill="x", **pad)
+        ttk.Label(
+            f_struct,
+            text="模板令牌：{type} 类别  {year}/{yyyy} 年  {mm} 月  {dd} 日  {ext} 扩展名（无点）   例：{type}/{yyyy}/{mm}").pack(
+            anchor="w", padx=10, pady=(4, 0))
+        fe = ttk.Frame(f_struct)
+        fe.pack(fill="x", padx=10, pady=(2, 8))
+        ttk.Label(fe, text="自定义模板:").pack(side="left", padx=(0, 4))
+        self.tmpl_entry = ttk.Entry(fe, textvariable=self.tmpl, width=42,
+                                    state="disabled")
+        self.tmpl_entry.pack(side="left", fill="x", expand=True)
+
+        # 扫描筛选：时间范围
+        f_filter = ttk.LabelFrame(
+            self.master, text="扫描筛选（按修改时间，扫描时生效）")
+        f_filter.pack(fill="x", **pad)
+        tf = ttk.Frame(f_filter)
+        tf.pack(fill="x", padx=10, pady=6)
+        ttk.Label(tf, text="时间范围:").pack(side="left", padx=(0, 4))
+        cb_t = ttk.Combobox(tf, textvariable=self.time_range, width=14,
+                            state="readonly")
+        cb_t["values"] = tuple(TIME_RANGES)
+        cb_t.bind("<<ComboboxSelected>>", self._on_time_range_change)
+        cb_t.pack(side="left", padx=(0, 10))
+        ttk.Label(tf, text="起:").pack(side="left", padx=(0, 2))
+        self.date_from_entry = ttk.Entry(tf, textvariable=self.date_from,
+                                         width=12, state="disabled")
+        self.date_from_entry.pack(side="left", padx=(0, 6))
+        ttk.Label(tf, text="止:").pack(side="left", padx=(0, 2))
+        self.date_to_entry = ttk.Entry(tf, textvariable=self.date_to,
+                                        width=12, state="disabled")
+        self.date_to_entry.pack(side="left", padx=(0, 6))
+        ttk.Label(tf, text="格式 YYYY-MM-DD（仅「自定义」时可用）").pack(
+            side="left", padx=(4, 0))
 
         # 归类类别勾选
         f_cat = ttk.LabelFrame(self.master, text="归类类别（取消勾选则不整理该类）")
@@ -551,6 +660,7 @@ class OrganizerApp:
         recursive = self.deep_scan.get()
         files = collect_sources(root, include_media=False, scan_all=False,
                                 recursive=recursive)
+        files = self._apply_time_filter(files)
         if not files:
             self.master.after(0, self._on_scan_empty, root)
             return
@@ -728,7 +838,8 @@ class OrganizerApp:
         threading.Thread(target=self._do_apply, args=(dest,), daemon=True).start()
 
     def _do_apply(self, dest):
-        scheme = SCHEME_LABELS.get(self.scheme.get(), "type")
+        label = self.scheme.get()
+        template = self.tmpl.get().strip()
         dedupe = self.dedupe.get()
         os.makedirs(dest, exist_ok=True)
         used = set()
@@ -743,8 +854,14 @@ class OrganizerApp:
                 skipped_dup += 1
                 continue
             seen_hash.add(r["hash"])
-            dp = dest_path(dest, scheme, r["cat"], r["month"],
-                           os.path.basename(r["path"]), used)
+            fname = os.path.basename(r["path"])
+            if label == "自定义模板":
+                rel = build_from_template(template or "{type}/{ext}", r["cat"],
+                                          r["month"], r["mtime"], fname)
+            else:
+                rel = preset_rel(SCHEME_LABELS.get(label, "type"), r["cat"],
+                                 r["month"], fname)
+            dp = dest_path(dest, rel, used)
             try:
                 os.makedirs(os.path.dirname(dp), exist_ok=True)
                 shutil.copy2(r["path"], dp)
@@ -1046,6 +1163,65 @@ class OrganizerApp:
                 "完成",
                 "已将 %d 个微信原始文件移入回收站（可在回收站恢复），\n输出目录的副本已保留。"
                 % ok)
+
+    # ---------- 界面联动 ----------
+    def _on_scheme_change(self, *a):
+        if self.scheme.get() == "自定义模板":
+            self.tmpl_entry.configure(state="normal")
+        else:
+            self.tmpl_entry.configure(state="disabled")
+
+    def _on_time_range_change(self, *a):
+        if self.time_range.get() == "自定义":
+            self.date_from_entry.configure(state="normal")
+            self.date_to_entry.configure(state="normal")
+        else:
+            self.date_from_entry.configure(state="disabled")
+            self.date_to_entry.configure(state="disabled")
+
+    def _apply_time_filter(self, files):
+        """按选择的修改时间范围过滤文件，返回过滤后的列表。"""
+        rng = self.time_range.get()
+        now = time.time()
+        lo = hi = None
+        if rng == "最近7天":
+            lo = now - 7 * 86400
+        elif rng == "最近30天":
+            lo = now - 30 * 86400
+        elif rng == "最近90天":
+            lo = now - 90 * 86400
+        elif rng == "今年":
+            lo = datetime(datetime.now().year, 1, 1).timestamp()
+        elif rng == "自定义":
+            fs = self.date_from.get().strip()
+            ts = self.date_to.get().strip()
+            try:
+                if fs:
+                    lo = datetime.strptime(fs, "%Y-%m-%d").timestamp()
+                if ts:
+                    hi = datetime.strptime(ts, "%Y-%m-%d").timestamp() + 86400
+            except ValueError:
+                self.log("[WARN] 自定义日期格式应为 YYYY-MM-DD，已忽略时间筛选。")
+                return files
+        if lo is None and hi is None:
+            return files
+        out, skipped = [], 0
+        for p in files:
+            try:
+                m = os.path.getmtime(p)
+            except OSError:
+                continue
+            if lo is not None and m < lo:
+                skipped += 1
+                continue
+            if hi is not None and m > hi:
+                skipped += 1
+                continue
+            out.append(p)
+        if skipped:
+            self.log("[FILTER] 时间范围「%s」已过滤 %d 个文件，剩余 %d 个"
+                     % (rng, skipped, len(out)))
+        return out
 
 
 
