@@ -18,6 +18,7 @@
 - v1.10.0：启动后自动扫描（微信目录有效时），并顶部显示三步使用提示，让普通用户打开即见结果。
 - v1.11.0：一键归类完成后自动打开输出文件夹；兼容模式标签改为更直白的「扫描整个文件夹（适合新版微信）」。
 - v1.12.0：记住用户上次使用的整理方式、筛选、类别勾选和输出目录；新增「打开输出文件夹」按钮，让重复使用更顺手。
+- v1.13.0：当自动探测不到微信目录时给出红色引导提示；一键归类后自动生成「整理清单.csv」，方便用户核对文件去向。
 """
 import os
 import re
@@ -31,7 +32,7 @@ import urllib.request
 from datetime import datetime
 
 # 当前版本与更新检查仓库（公开 Release）
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.13.0"
 UPDATE_REPO = "oracis/wechat-file-organizer-gui"
 
 try:
@@ -413,10 +414,17 @@ class OrganizerApp:
         # 源目录
         f_src = ttk.LabelFrame(self.master, text="微信文件目录")
         f_src.pack(fill="x", **pad)
-        ttk.Entry(f_src, textvariable=self.source_dir, width=86).pack(
-            side="left", fill="x", expand=True, padx=(8, 4), pady=8)
-        ttk.Button(f_src, text="浏览...", command=self.browse_source).pack(
-            side="left", padx=(0, 8), pady=8)
+        f_src_row = ttk.Frame(f_src)
+        f_src_row.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Entry(f_src_row, textvariable=self.source_dir, width=86).pack(
+            side="left", fill="x", expand=True, padx=(0, 4))
+        ttk.Button(f_src_row, text="浏览...", command=self.browse_source).pack(
+            side="left", padx=(0, 8))
+        self.src_hint = ttk.Label(f_src, text="", foreground="#b00020")
+        self.src_hint.pack(anchor="w", padx=10, pady=(0, 6))
+        if not self.source_dir.get().strip():
+            self.src_hint.configure(
+                text="（未自动找到微信目录，请点「浏览」手动选择微信文件夹）")
 
         # 设置
         f_set = ttk.LabelFrame(self.master, text="归类设置")
@@ -642,6 +650,7 @@ class OrganizerApp:
         d = filedialog.askdirectory(title="选择微信文件目录")
         if d:
             self.source_dir.set(d)
+            self.src_hint.configure(text="")
             self.apply_btn.configure(state="disabled")
             self.del_orig_btn.configure(state="disabled")
             self.tree.delete(*self.tree.get_children())
@@ -889,7 +898,33 @@ class OrganizerApp:
             except OSError as e:
                 self.master.after(0, lambda m=str(e): self.log("[WARN] 复制失败: " + m))
         self.has_organized = True
+        self._write_report(dest)
         self.master.after(0, self._on_apply_done, dest, copied, skipped_dup, skipped_cat)
+
+    def _write_report(self, dest):
+        """在输出目录写入整理清单 CSV，方便用户核对文件去向。"""
+        if not self.copy_map:
+            return
+        import csv
+        path = os.path.join(dest, "整理清单.csv")
+        try:
+            with open(path, "w", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f)
+                w.writerow(["文件名", "类别", "大小", "原始路径", "整理后路径"])
+                for src, dst in self.copy_map.items():
+                    if not os.path.exists(dst):
+                        continue
+                    w.writerow([
+                        os.path.basename(dst),
+                        cat_of(dst),
+                        human(os.path.getsize(dst)),
+                        src,
+                        dst,
+                    ])
+            self.master.after(
+                0, lambda: self.log("[INFO] 已生成整理清单: " + path))
+        except OSError as e:
+            self.master.after(0, lambda m=str(e): self.log("[WARN] 写入整理清单失败: " + m))
 
     def _on_apply_done(self, dest, copied, skipped_dup, skipped_cat):
         self.progress.stop()
